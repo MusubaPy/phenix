@@ -14,3 +14,6 @@
 
 test(task_test)
 target_link_libraries(task_test load gmock libtestspeed)
+
+test(quadruped_stability_test)
+target_link_libraries(quadruped_stability_test gmock load libtestspeed)

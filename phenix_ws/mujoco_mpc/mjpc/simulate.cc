@@ -15,6 +15,7 @@
 #include "mjpc/simulate.h"  // mjpc fork
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -909,6 +910,71 @@ void MakeControlSection(mj::Simulate* sim, int oldstate) {
   }
 }
 
+// try to locate a body that should be tracked by the default camera
+int FindDefaultTrackingBody(const mj::Simulate* sim) {
+  if (!sim || !sim->m) {
+    return -1;
+  }
+  const mjModel* model = sim->m;
+
+  static constexpr std::array<const char*, 8> kPreferredBodies = {
+      "trunk", "torso", "pelvis", "base", "root", "body", "chassis",
+      "abdomen"};
+
+  for (const char* name : kPreferredBodies) {
+    int body_id = mj_name2id(model, mjOBJ_BODY, name);
+    if (body_id >= 1) {
+      return body_id;
+    }
+    body_id = mj_name2id(model, mjOBJ_XBODY, name);
+    if (body_id >= 1) {
+      return body_id;
+    }
+  }
+
+  int fallback_id = -1;
+  double heaviest_mass = 0.0;
+  for (int body = 1; body < model->nbody; ++body) {
+    if (model->body_dofnum[body] <= 0) {
+      continue;
+    }
+    double mass = model->body_mass[body];
+    if (mass > heaviest_mass) {
+      heaviest_mass = mass;
+      fallback_id = body;
+    }
+  }
+
+  if (fallback_id >= 1) {
+    return fallback_id;
+  }
+
+  if (model->nbody > 1) {
+    return 1;
+  }
+
+  return -1;
+}
+
+void ConfigureTrackingCamera(mj::Simulate* sim) {
+  if (!sim || !sim->m) {
+    return;
+  }
+
+  int tracking_body = FindDefaultTrackingBody(sim);
+  if (tracking_body < 1) {
+    return;
+  }
+
+  sim->cam.type = mjCAMERA_TRACKING;
+  sim->cam.trackbodyid = tracking_body;
+  sim->cam.fixedcamid = -1;
+
+  if (sim->d) {
+    mju_copy3(sim->cam.lookat, sim->d->xpos + 3 * tracking_body);
+  }
+}
+
 // make model-dependent UI sections
 void MakeUiSections(mj::Simulate* sim) {
   // get section open-close state, UI 0
@@ -948,6 +1014,7 @@ void MakeUiSections(mj::Simulate* sim) {
 void AlignAndScaleView(mj::Simulate* sim) {
   // use default free camera parameters
   mjv_defaultFreeCamera(sim->m, &sim->cam);
+  ConfigureTrackingCamera(sim);
 }
 
 

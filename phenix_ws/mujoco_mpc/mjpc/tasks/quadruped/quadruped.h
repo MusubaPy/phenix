@@ -38,7 +38,11 @@ class QuadrupedFlat : public Task {
         for (int motor = 0; motor < kMotorsPerFoot; ++motor) {
           motor_body_id_[foot][motor] = -1;
         }
+        mju_zero3(filtered_foot_force_[foot]);
+        mju_zero3(filtered_contact_normal_[foot]);
       }
+      last_grf_update_time_ = -1.0;
+      last_debug_print_time_ = -1.0;
     }
     ResidualFn(const ResidualFn&) = default;
     void Residual(const mjModel* model, const mjData* data,
@@ -88,6 +92,17 @@ class QuadrupedFlat : public Task {
   constexpr static double kDesiredAccelFilterTimeConstant = 0.05;  // second
   constexpr static double kDesiredAccelMaxDt = 0.2;                // second
   constexpr static double kDesiredAccelLimit = 30.0;               // m/s^2
+  constexpr static double kGrfFilterTimeConstant = 0.01;           // second
+  constexpr static double kSupportForceActivation = 5.0;           // newton
+  constexpr static double kPlanarSpeedLow = 0.15;                  // m/s
+  constexpr static double kPlanarSpeedHigh = 1.2;                  // m/s
+  constexpr static double kPlanarSpeedFloor = 0.35;                // unitless
+  constexpr static double kDynamicGaitPlanarScale = 0.45;          // unitless
+  constexpr static double kNetForceMinScale = 0.15;                // unitless
+  constexpr static double kHindAlignmentMinScale = 0.25;           // unitless
+  constexpr static double kDebugLogInterval = 0.05;                // second
+  constexpr static double kSupportResidualMinFraction = 0.1;       // unitless
+  constexpr static double kGrfWeightSoftReference = 5.0e-1;        // unitless
     static constexpr const char* const kMotorBodyNames[kNumFoot]
         [kMotorsPerFoot] = {
             {"FL_hip", "FL_thigh", "FL_calf"},
@@ -255,6 +270,7 @@ class QuadrupedFlat : public Task {
     int height_cost_id_       = -1;
     int grf_cost_id_          = -1;
     int hind_grf_cost_id_     = -1;
+  int debug_log_param_id_   = -1;
     int foot_geom_id_[kNumFoot];
     int shoulder_body_id_[kNumFoot];
     int motor_body_id_[kNumFoot][kMotorsPerFoot];
@@ -281,6 +297,10 @@ class QuadrupedFlat : public Task {
     mutable double filtered_desired_accel_[3];
     mutable double last_com_vel_[3];
     mutable double last_accel_time_ = -1.0;
+    mutable double filtered_foot_force_[kNumFoot][3];
+    mutable double filtered_contact_normal_[kNumFoot][3];
+    mutable double last_grf_update_time_ = -1.0;
+    mutable double last_debug_print_time_ = -1.0;
 
   };
 

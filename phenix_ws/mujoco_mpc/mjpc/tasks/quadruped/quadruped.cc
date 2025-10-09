@@ -14,6 +14,7 @@
 
 #include "mjpc/tasks/quadruped/quadruped.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
@@ -230,13 +231,15 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
 
 
   // ---------- Ground reaction forces ----------
+  double foot_force_contact[kNumFoot][3];
   double foot_force[kNumFoot][3];
   double contact_point[kNumFoot][3];
   double contact_normal[kNumFoot][3];
   double max_normal_component[kNumFoot] = {0};
   bool foot_in_contact[kNumFoot] = {false};
   for (A1Foot foot : kFootAll) {
-    mju_zero3(foot_force[foot]);
+  mju_zero3(foot_force_contact[foot]);
+  mju_zero3(foot_force[foot]);
     mju_zero3(contact_point[foot]);
     mju_zero3(contact_normal[foot]);
   }
@@ -257,6 +260,35 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
                << std::setw(9) << v[2] << "]";
     return vec_stream.str();
   };
+
+  const double grf_weight =
+      (grf_cost_id_ >= 0 &&
+       grf_cost_id_ < static_cast<int>(weight_.size()))
+          ? weight_[grf_cost_id_]
+          : 0.0;
+  const double hind_weight = (hind_grf_cost_id_ >= 0 &&
+                              hind_grf_cost_id_ <
+                                  static_cast<int>(weight_.size()))
+                                 ? weight_[hind_grf_cost_id_]
+                                 : 0.0;
+
+  auto weight_scale = [&](double weight_value) {
+    if (weight_value <= 0.0) {
+      return 0.0;
+    }
+    double denom = weight_value + kGrfWeightSoftReference;
+    if (denom <= 0.0) {
+      return 0.0;
+    }
+    double ratio = weight_value / denom;
+    ratio = mju_clip(ratio, 0.0, 1.0);
+    return std::sqrt(ratio);
+  };
+
+  const double grf_weight_scale = weight_scale(grf_weight);
+  const double hind_weight_scale = weight_scale(hind_weight);
+  const double net_force_weight_scale =
+      std::max(grf_weight_scale, hind_weight_scale);
 
   for (int i = 0; i < data->ncon; ++i) {
     const mjContact& contact = data->contact[i];
@@ -284,7 +316,7 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
       applied_force[1] = -force_world[1];
       applied_force[2] = -force_world[2];
     }
-    mju_addTo3(foot_force[contact_foot], applied_force);
+  mju_addTo3(foot_force_contact[contact_foot], applied_force);
 
     double normal_world[3] = {contact.frame[6], contact.frame[7],
                               contact.frame[8]};
@@ -310,11 +342,109 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
     }
   }
 
+  // prefer body-level contact wrench (`cfrc_ext`) for magnitude stability,
+  // but fall back to accumulated contact forces if unavailable.
+  for (A1Foot foot : kFootAll) {
+    int geom_id = foot_geom_id_[foot];
+    int body_id = (geom_id >= 0 && geom_id < model->ngeom)
+                      ? model->geom_bodyid[geom_id]
+                      : -1;
+    if (body_id >= 0 && body_id < model->nbody) {
+      const double* cfrc = data->cfrc_ext + 6 * body_id;
+      // cfrc_ext stores wrench in rotation:translation order, grab the force.
+      mju_copy3(foot_force[foot], cfrc + 3);
+    }
+  double contact_norm = mju_norm3(foot_force_contact[foot]);
+  if (mju_norm3(foot_force[foot]) < kContactForceThreshold &&
+    contact_norm > 0.0) {
+      mju_copy3(foot_force[foot], foot_force_contact[foot]);
+    }
+  }
+
+  const double gravity_norm = mju_norm3(model->opt.gravity);
+  double foot_force_limit = total_mass_ * (gravity_norm + kDesiredAccelLimit);
+  if (!std::isfinite(foot_force_limit) || foot_force_limit <= 0.0) {
+    foot_force_limit = 1.0e3;
+  }
+  auto sanitize_force = [&](double force_vec[3]) {
+    for (int axis = 0; axis < 3; ++axis) {
+      if (!std::isfinite(force_vec[axis])) {
+        force_vec[axis] = 0.0;
+      }
+    }
+    double norm = mju_norm3(force_vec);
+    if (!std::isfinite(norm)) {
+      mju_zero3(force_vec);
+      return;
+    }
+    if (norm > foot_force_limit && foot_force_limit > 1.0e-6) {
+      mju_scl3(force_vec, force_vec, foot_force_limit / norm);
+    }
+  };
+  for (A1Foot foot : kFootAll) {
+    sanitize_force(foot_force[foot]);
+  }
+
+  double dt_grf = data->time - last_grf_update_time_;
+  bool reset_grf_filter = (last_grf_update_time_ < 0.0) ||
+                          (dt_grf <= 0.0) ||
+                          (dt_grf > kDesiredAccelMaxDt);
+  double alpha_grf = reset_grf_filter
+                         ? 1.0
+                         : 1.0 - std::exp(-dt_grf / kGrfFilterTimeConstant);
+  alpha_grf = mju_clip(alpha_grf, 0.0, 1.0);
+  double decay_grf = 1.0 - alpha_grf;
+
+  bool effective_contact[kNumFoot] = {false};
+  for (A1Foot foot : kFootAll) {
+    if (foot_in_contact[foot]) {
+      if (reset_grf_filter) {
+        mju_copy3(filtered_foot_force_[foot], foot_force[foot]);
+        mju_copy3(filtered_contact_normal_[foot], contact_normal[foot]);
+      } else {
+        for (int axis = 0; axis < 3; ++axis) {
+          filtered_foot_force_[foot][axis] +=
+              alpha_grf *
+              (foot_force[foot][axis] - filtered_foot_force_[foot][axis]);
+          filtered_contact_normal_[foot][axis] +=
+              alpha_grf *
+              (contact_normal[foot][axis] -
+               filtered_contact_normal_[foot][axis]);
+        }
+        double normal_norm = mju_norm3(filtered_contact_normal_[foot]);
+        if (normal_norm > kContactForceThreshold) {
+          mju_scl3(filtered_contact_normal_[foot],
+                   filtered_contact_normal_[foot], 1.0 / normal_norm);
+        } else {
+          mju_zero3(filtered_contact_normal_[foot]);
+        }
+      }
+    } else {
+      if (reset_grf_filter) {
+        mju_zero3(filtered_foot_force_[foot]);
+        mju_zero3(filtered_contact_normal_[foot]);
+      } else {
+        mju_scl3(filtered_foot_force_[foot], filtered_foot_force_[foot],
+                 decay_grf);
+        if (mju_norm3(filtered_foot_force_[foot]) <
+            0.5 * kSupportForceActivation) {
+          mju_zero3(filtered_foot_force_[foot]);
+          mju_zero3(filtered_contact_normal_[foot]);
+        }
+      }
+    }
+    sanitize_force(filtered_foot_force_[foot]);
+    double filtered_norm = mju_norm3(filtered_foot_force_[foot]);
+    effective_contact[foot] =
+        foot_in_contact[foot] || filtered_norm > kSupportForceActivation;
+  }
+  last_grf_update_time_ = data->time;
+
   double net_grf[3] = {0, 0, 0};
   bool any_support = false;
   for (A1Foot foot : kFootAll) {
-    mju_addTo3(net_grf, foot_force[foot]);
-    any_support = any_support || foot_in_contact[foot];
+    mju_addTo3(net_grf, filtered_foot_force_[foot]);
+    any_support = any_support || effective_contact[foot];
   }
 
   const int label_width = 8;
@@ -349,13 +479,22 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
     print_separator();
   }
 
-  const double gravity_norm = mju_norm3(model->opt.gravity);
   const double vertical_capacity = total_mass_ * gravity_norm;
 
   double support_force = 0.0;
   for (A1Foot foot : kFootAll) {
-    if (!foot_in_contact[foot]) continue;
-    double normal_contrib = mju_dot3(foot_force[foot], contact_normal[foot]);
+    if (!effective_contact[foot]) continue;
+    const double* force_eval = filtered_foot_force_[foot];
+    double normal_eval[3];
+    if (mju_norm3(filtered_contact_normal_[foot]) > kContactForceThreshold) {
+      mju_copy3(normal_eval, filtered_contact_normal_[foot]);
+    } else {
+      mju_copy3(normal_eval, contact_normal[foot]);
+    }
+    double normal_norm = mju_norm3(normal_eval);
+    if (normal_norm <= kContactForceThreshold) continue;
+    mju_scl3(normal_eval, normal_eval, 1.0 / normal_norm);
+    double normal_contrib = mju_dot3(force_eval, normal_eval);
     if (normal_contrib > 0.0) support_force += normal_contrib;
   }
   double support_fraction = 0.0;
@@ -363,19 +502,49 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
     support_fraction = mju_clip(support_force / vertical_capacity, 0.0, 1.0);
   }
 
+  double planar_scale = 1.0;
+  double planar_speed = 0.0;
+  if (comvel != nullptr) {
+    planar_speed = std::hypot(comvel[0], comvel[1]);
+  }
+  if (kPlanarSpeedHigh > kPlanarSpeedLow) {
+    double speed_alpha =
+        (planar_speed - kPlanarSpeedLow) /
+        (kPlanarSpeedHigh - kPlanarSpeedLow);
+    speed_alpha = mju_clip(speed_alpha, 0.0, 1.0);
+    double speed_scale = 1.0 - (1.0 - kPlanarSpeedFloor) * speed_alpha;
+    planar_scale = speed_scale;
+  }
+  if (gait == kGaitTrot || gait == kGaitCanter || gait == kGaitGallop) {
+    planar_scale *= kDynamicGaitPlanarScale;
+  }
+  planar_scale = mju_clip(planar_scale, kNetForceMinScale, 1.0);
+
+  double support_gate = support_fraction;
+  if (kSupportResidualMinFraction > 1.0e-9) {
+    support_gate /= kSupportResidualMinFraction;
+  }
+  support_gate = mju_clip(support_gate, 0.0, 1.0);
+  double grf_target_effective[3];
+  mju_copy3(grf_target_effective, grf_target_);
+  mju_scl3(grf_target_effective, grf_target_effective,
+           mju_clip(support_fraction, 0.0, 1.0));
+
   double net_force_error_raw[3];
-  mju_sub3(net_force_error_raw, net_grf, grf_target_);
+  mju_sub3(net_force_error_raw, net_grf, grf_target_effective);
 
   double net_force_error_normalized[3] = {0, 0, 0};
-  if (support_fraction > 0.05) {
-    // делаем цель «0 0 mg» мягкой: нормируем ошибку на допустимую опорную силу
+  if (support_gate > 0.0 && net_force_weight_scale > 0.0) {
     double denom = vertical_capacity > 1.0 ? vertical_capacity : 1.0;
     for (int i = 0; i < 3; ++i) {
       net_force_error_normalized[i] = net_force_error_raw[i] / denom;
     }
-    // плавно отключаем штраф, когда робот почти в полёте
     mju_scl3(net_force_error_normalized, net_force_error_normalized,
-             support_fraction);
+             support_gate);
+    net_force_error_normalized[0] *= planar_scale;
+    net_force_error_normalized[1] *= planar_scale;
+    mju_scl3(net_force_error_normalized, net_force_error_normalized,
+             net_force_weight_scale);
     mju_copy3(residual + counter, net_force_error_normalized);
   } else {
     mju_zero3(residual + counter);
@@ -391,8 +560,14 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
             << format_vec(net_force_error_normalized) << "\n";
   }
 
+  double hind_alignment_residual[kNumFoot] = {0, 0, 0, 0};
   for (A1Foot foot : kFootHind) {
     double alignment_residual = 0;
+    if (hind_weight_scale <= 0.0) {
+      hind_alignment_residual[foot] = 0.0;
+      residual[counter++] = 0.0;
+      continue;
+    }
   [[maybe_unused]] std::ostringstream stage_log;
     if (kEnableGrfDebugLog) {
       stage_log.setf(std::ios::fixed, std::ios::floatfield);
@@ -402,14 +577,14 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
       stage_log << "  Контакт: "
                 << (foot_in_contact[foot] ? "да" : "нет") << "\n";
     }
-    if (foot_in_contact[foot]) {
-      double force_norm = mju_norm3(foot_force[foot]);
+    if (foot_in_contact[foot] && effective_contact[foot]) {
+      double force_norm = mju_norm3(filtered_foot_force_[foot]);
       if (kEnableGrfDebugLog) {
         stage_log << "  Норма силы: " << force_norm << "\n";
       }
       if (force_norm > kContactForceThreshold) {
         double grf_unit[3];
-        mju_copy3(grf_unit, foot_force[foot]);
+        mju_copy3(grf_unit, filtered_foot_force_[foot]);
         mju_scl3(grf_unit, grf_unit, 1.0 / force_norm);
         if (kEnableGrfDebugLog) {
           stage_log << "  Единичный GRF: " << format_vec(grf_unit) << "\n";
@@ -506,7 +681,118 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
       stage_log << "  Итоговый residual: " << alignment_residual << "\n";
       grf_log << stage_log.str();
     }
+    double hind_scale = mju_max(planar_scale, kHindAlignmentMinScale);
+    alignment_residual *= hind_scale;
+    alignment_residual *= hind_weight_scale;
+    hind_alignment_residual[foot] = alignment_residual;
     residual[counter++] = alignment_residual;
+  }
+
+  bool debug_logging = false;
+  if (debug_log_param_id_ >= 0 &&
+      debug_log_param_id_ < static_cast<int>(parameters_.size())) {
+    debug_logging = parameters_[debug_log_param_id_] > 0.5;
+  }
+  if (debug_logging) {
+    double interval = kDebugLogInterval;
+    if (last_debug_print_time_ < 0.0 ||
+        data->time - last_debug_print_time_ >= interval) {
+      last_debug_print_time_ = data->time;
+      static const char* const kModeNames[] = {
+          "Quadruped", "Biped", "Walk", "Scramble", "Flip"};
+      static const char* const kGaitNames[] = {
+          "Stand", "Walk", "Trot", "Canter", "Gallop"};
+      const char* mode_name =
+          (current_mode_ >= 0 && current_mode_ < kNumMode)
+              ? kModeNames[current_mode_]
+              : "Unknown";
+      const char* gait_name = (gait >= 0 && gait < kNumGait)
+                                  ? kGaitNames[gait]
+                                  : "Unknown";
+      std::ostringstream dbg;
+      dbg.setf(std::ios::fixed, std::ios::floatfield);
+      dbg << std::setprecision(3);
+      dbg << "[GRF DEBUG] t=" << data->time << " mode=" << mode_name
+          << " gait=" << gait_name << " planar_speed=" << planar_speed
+          << " support=" << support_fraction
+          << " planar_scale=" << planar_scale
+          << " weight(GRF)=" << grf_weight
+      << " weight_scale(GRF)=" << grf_weight_scale
+      << " weight(HindAlign)=" << hind_weight
+      << " weight_scale(HindAlign)=" << hind_weight_scale << "\n";
+      dbg << "  target=" << format_vec(grf_target_)
+          << " net=" << format_vec(net_grf)
+          << " error=" << format_vec(net_force_error_raw) << "\n";
+
+  double weighted_terms[mjpc::kMaxCostTerms];
+  double raw_terms[mjpc::kMaxCostTerms];
+  std::fill(weighted_terms, weighted_terms + mjpc::kMaxCostTerms, 0.0);
+  std::fill(raw_terms, raw_terms + mjpc::kMaxCostTerms, 0.0);
+      CostTerms(weighted_terms, residual, /*weighted=*/true);
+      CostTerms(raw_terms, residual, /*weighted=*/false);
+      double total_objective = 0.0;
+      for (int term = 0; term < num_term_; ++term) {
+        if (std::isfinite(weighted_terms[term])) {
+          total_objective += weighted_terms[term];
+        }
+      }
+      auto cost_term_name = [&](int term_index) -> std::string {
+        if (term_index >= 0 &&
+            term_index < static_cast<int>(task_->weight_names.size()) &&
+            !task_->weight_names[term_index].empty()) {
+          return task_->weight_names[term_index];
+        }
+        std::ostringstream name_stream;
+        name_stream << "term[" << term_index << "]";
+        return name_stream.str();
+      };
+      dbg << "  objective_total=" << total_objective << "\n";
+      dbg << "  cost_impact:";
+      if (num_term_ == 0) {
+        dbg << " <no cost terms detected>";
+      }
+      dbg << "\n";
+      for (int term = 0; term < num_term_; ++term) {
+        double weighted_cost = weighted_terms[term];
+        double raw_cost = raw_terms[term];
+        double weight_value =
+            (term >= 0 && term < static_cast<int>(weight_.size()))
+                ? weight_[term]
+                : 0.0;
+        if (!std::isfinite(weighted_cost) && !std::isfinite(raw_cost)) {
+          continue;
+        }
+        if (!std::isfinite(weighted_cost)) {
+          weighted_cost = 0.0;
+        }
+        if (!std::isfinite(raw_cost)) {
+          raw_cost = 0.0;
+        }
+        double share = 0.0;
+        if (total_objective > 1.0e-9) {
+          share = weighted_cost / total_objective;
+        }
+        dbg << "    " << cost_term_name(term)
+            << ": weighted=" << weighted_cost
+            << " raw=" << raw_cost
+            << " weight=" << weight_value
+            << " share=" << share * 100.0 << "%\n";
+      }
+      for (A1Foot foot : kFootAll) {
+        double force_norm = mju_norm3(filtered_foot_force_[foot]);
+        dbg << "  " << kFootNames[foot]
+            << " contact=" << (effective_contact[foot] ? "Y" : "N")
+            << " raw_contact=" << (foot_in_contact[foot] ? "Y" : "N")
+            << " |f|=" << force_norm
+            << " f=" << format_vec(filtered_foot_force_[foot]) << "\n";
+      }
+      for (A1Foot foot : kFootHind) {
+        dbg << "    hind_align[" << kFootNames[foot]
+            << "]=" << hind_alignment_residual[foot] << "\n";
+      }
+      dbg << std::flush;
+      std::cout << dbg.str();
+    }
   }
 
   if (kEnableGrfDebugLog) {
@@ -676,6 +962,14 @@ void QuadrupedFlat::TransitionLocked(mjModel* model, mjData* data) {
       residual_.last_transition_time_ == -1) {
     if (mode != ResidualFn::kModeQuadruped && mode != ResidualFn::kModeBiped) {
       mode = ResidualFn::kModeQuadruped;  // mode stateful, switch to Quadruped
+    }
+    if (residual_.gait_switch_param_id_ >= 0 &&
+        residual_.gait_switch_param_id_ < static_cast<int>(parameters.size())) {
+      int current_switch =
+          ReinterpretAsInt(parameters[residual_.gait_switch_param_id_]);
+      if (current_switch == 0) {
+        parameters[residual_.gait_switch_param_id_] = ReinterpretAsDouble(1);
+      }
     }
     residual_.last_transition_time_ = residual_.phase_start_time_ =
         residual_.phase_start_ = data->time;
@@ -1023,6 +1317,7 @@ void QuadrupedFlat::ResetLocked(const mjModel* model) {
   residual_.amplitude_param_id_ = ParameterIndex(model, "Amplitude");
   residual_.duty_param_id_ = ParameterIndex(model, "Duty ratio");
   residual_.arm_posture_param_id_ = ParameterIndex(model, "Arm posture");
+  residual_.debug_log_param_id_ = ParameterIndex(model, "Debug GRF log");
   residual_.balance_cost_id_ = CostTermByName(model, "Balance");
   residual_.upright_cost_id_ = CostTermByName(model, "Upright");
   residual_.height_cost_id_ = CostTermByName(model, "Height");
@@ -1105,6 +1400,7 @@ void QuadrupedFlat::ResetLocked(const mjModel* model) {
   mju_zero3(residual_.filtered_desired_accel_);
   mju_zero3(residual_.last_com_vel_);
   residual_.last_accel_time_ = -1.0;
+  residual_.last_debug_print_time_ = -1.0;
 
   // ----------  derived kinematic quantities for Flip  ----------
   residual_.gravity_ = mju_norm3(model->opt.gravity);

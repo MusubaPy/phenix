@@ -165,7 +165,7 @@ case "$MODE" in
     RUN_ARGS+=(
       "--gpus" "all"
       "-e" "DISPLAY=$DISPLAY"
-      "-e" "WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+      # "-e" "WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
       "-e" "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
       "-e" "QT_X11_NO_MITSHM=1"
       "-e" "NVIDIA_VISIBLE_DEVICES=all"

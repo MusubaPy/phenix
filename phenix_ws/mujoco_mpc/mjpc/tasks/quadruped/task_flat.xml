@@ -24,6 +24,7 @@
     <numeric name="residual_Duty ratio" data="0 0 1"/>
     <numeric name="residual_Walk speed" data="0 0 4"/>
     <numeric name="residual_Walk turn" data="0 -2 2"/>
+  <numeric name="residual_Debug GRF log" data="1 0 1"/>
     <numeric name="residual_select_Flip dir" data="0"/>
     <text name="residual_list_Flip dir" data="Back Flip|Front Flip"/>
     <numeric name="residual_select_Biped type" data="0"/>
@@ -109,8 +110,8 @@
     <user name="Posture" dim="12" user="0 0.02 0.0 0.1" />
     <user name="Orientation" dim="2" user="0 0 0 .03" />
     <user name="Angmom" dim="3" user="0 0 0 .03" />
-  <user name="GRF" dim="3" user="2 0.000 0 1 0.0001" />
-  <user name="Hind GRF Align" dim="2" user="2 0.000 0 0.5 0.001" />
+  <user name="GRF" dim="3" user="0.01 0.00001 0 0.00001 0.00001" />
+  <user name="Hind GRF Align" dim="2" user="0.01 0.00001 0 0.00001 0.00001" />
 
     <!-- estimator measurements -->
     <framepos name="torso_pos" objtype="site" objname="torso" />
