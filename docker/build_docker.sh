@@ -13,11 +13,11 @@ ROS_DISTRO="humble"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -nc|--nvidiac)
-      BASE_IMAGE="nvidia/cuda:13.0.1-runtime-ubuntu22.04"
+      BASE_IMAGE="nvidia/cuda:13.0.1-runtime-ubuntu24.04"
       shift
       ;;
     -ng|--nvidiag)
-      BASE_IMAGE="nvidia/opengl:1.2-glvnd-devel-ubuntu22.04"
+      BASE_IMAGE="nvidia/opengl:1.2-glvnd-devel-ubuntu24.04"
       shift
       ;;
     --cuda-image)

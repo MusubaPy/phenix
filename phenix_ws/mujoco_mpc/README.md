@@ -137,6 +137,30 @@ cd bin
 ./mjpc
 ```
 
+> #### WSL2 + NVIDIA GPU
+> Running MJPC under Windows Subsystem for Linux defaults to Mesa's software renderer (llvmpipe).
+> To enable hardware acceleration, export the D3D12 Gallium driver before launching the GUI:
+>
+> ```sh
+> # optional sanity check — llvmpipe means software rendering
+> glxinfo -B | grep "OpenGL renderer"
+>
+> # enable the D3D12 backend and start MJPC
+> export GALLIUM_DRIVER=d3d12
+> export MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA
+> ./mjpc
+> ```
+>
+> After switching, `glxinfo -B` should report `OpenGL renderer string: D3D12 (NVIDIA …)` and `Accelerated: yes`.
+>
+> For convenience you can also run `scripts/run_mjpc_gpu.sh`, which exports the variables and then executes the
+> prebuilt binary from `build/bin/mjpc`:
+>
+> ```sh
+> cd ..
+> scripts/run_mjpc_gpu.sh
+> ```
+
 ### Build and Run MJPC GUI application using VSCode
 We recommend using [VSCode](https://code.visualstudio.com/) and 2 of its
 extensions ([CMake Tools](https://marketplace.visualstudio.com/items?itemName=ms-vscode.cmake-tools)

@@ -160,14 +160,23 @@ case "$MODE" in
   x11-nvidia)
     ensure_x_access
     maybe_mount_xauth
+    export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}
+
     RUN_ARGS+=(
       "--gpus" "all"
-      "-e" "DISPLAY"
-      "-v" "/tmp/.X11-unix:/tmp/.X11-unix:rw"
+      "-e" "DISPLAY=$DISPLAY"
+      "-e" "WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+      "-e" "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
       "-e" "QT_X11_NO_MITSHM=1"
       "-e" "NVIDIA_VISIBLE_DEVICES=all"
       "-e" "NVIDIA_DRIVER_CAPABILITIES=all"
       "-e" "__GLX_VENDOR_LIBRARY_NAME=nvidia"
+      "-e" "MUJOCO_GL=egl"
+      "-v" "/tmp/.X11-unix:/tmp/.X11-unix"
+      "-v" "/mnt/wslg:/mnt/wslg"
+      "-v" "/usr/lib/wsl/lib:/usr/lib/wsl/lib:ro"
+      "-e" "LD_LIBRARY_PATH=/usr/lib/wsl/lib:${LD_LIBRARY_PATH}"
+      "-e" "LIBGL_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri"
     )
     wsl_nvidia_mounts
     if [[ "${IS_WSL}" -eq 0 ]]; then

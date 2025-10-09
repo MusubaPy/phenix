@@ -16,6 +16,7 @@
 #define MJPC_TASKS_QUADRUPED_QUADRUPED_H_
 
 #include <string>
+#include <vector>
 #include <mujoco/mujoco.h>
 #include "mjpc/task.h"
 
@@ -280,6 +281,7 @@ class QuadrupedFlat : public Task {
     mutable double filtered_desired_accel_[3];
     mutable double last_com_vel_[3];
     mutable double last_accel_time_ = -1.0;
+
   };
 
   QuadrupedFlat() : residual_(this) {}

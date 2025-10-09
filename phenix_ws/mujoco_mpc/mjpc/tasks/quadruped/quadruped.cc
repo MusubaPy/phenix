@@ -241,10 +241,14 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
     mju_zero3(contact_normal[foot]);
   }
 
-  std::ostringstream grf_log;
-  grf_log.setf(std::ios::fixed, std::ios::floatfield);
-  grf_log << std::setprecision(3);
-  const auto format_vec = [](const double v[3]) -> std::string {
+  constexpr bool kEnableGrfDebugLog = false;
+
+  [[maybe_unused]] std::ostringstream grf_log;
+  if (kEnableGrfDebugLog) {
+    grf_log.setf(std::ios::fixed, std::ios::floatfield);
+    grf_log << std::setprecision(3);
+  }
+  [[maybe_unused]] const auto format_vec = [](const double v[3]) -> std::string {
     std::ostringstream vec_stream;
     vec_stream.setf(std::ios::fixed, std::ios::floatfield);
     vec_stream << std::setprecision(3)
@@ -315,7 +319,7 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
 
   const int label_width = 8;
   const int value_width = 12;
-  auto print_separator = [&]() {
+  [[maybe_unused]] auto print_separator = [&]() {
     grf_log << '+' << std::string(label_width + 2, '-');
     for (int axis = 0; axis < 3; ++axis) {
       grf_log << '+' << std::string(value_width + 2, '-');
@@ -323,119 +327,191 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
     grf_log << "+\n";
   };
 
-  grf_log << "\n[GRF] Таблица сил реакции опоры (Н)\n";
-  print_separator();
-  grf_log << "| " << std::setw(label_width) << std::left << "Нога";
-  for (const char* axis_name : {"Fx", "Fy", "Fz"}) {
-    grf_log << " | " << std::setw(value_width) << std::left << axis_name;
-  }
-  grf_log << " |\n";
-  print_separator();
-  for (A1Foot foot : kFootAll) {
-    grf_log << "| " << std::setw(label_width) << std::left
-            << kFootNames[foot];
-    grf_log << std::right;
-    for (int axis = 0; axis < 3; ++axis) {
-      grf_log << " | " << std::setw(value_width) << foot_force[foot][axis];
+  if (kEnableGrfDebugLog) {
+    grf_log << "\n[GRF] Таблица сил реакции опоры (Н)\n";
+    print_separator();
+    grf_log << "| " << std::setw(label_width) << std::left << "Нога    ";
+    for (const char* axis_name : {"Fx", "Fy", "Fz"}) {
+      grf_log << " | " << std::setw(value_width) << std::left << axis_name;
     }
     grf_log << " |\n";
-    grf_log << std::left;
+    print_separator();
+    for (A1Foot foot : kFootAll) {
+      grf_log << "| " << std::setw(label_width) << std::left
+              << kFootNames[foot];
+      grf_log << std::right;
+      for (int axis = 0; axis < 3; ++axis) {
+        grf_log << " | " << std::setw(value_width) << foot_force[foot][axis];
+      }
+      grf_log << " |\n";
+      grf_log << std::left;
+    }
+    print_separator();
   }
-  print_separator();
 
-  double net_force_error[3] = {0, 0, 0};
-  if (any_support) {
-    mju_sub3(net_force_error, net_grf, grf_target_);
-    mju_copy3(residual + counter, net_force_error);
+  const double gravity_norm = mju_norm3(model->opt.gravity);
+  const double vertical_capacity = total_mass_ * gravity_norm;
+
+  double support_force = 0.0;
+  for (A1Foot foot : kFootAll) {
+    if (!foot_in_contact[foot]) continue;
+    double normal_contrib = mju_dot3(foot_force[foot], contact_normal[foot]);
+    if (normal_contrib > 0.0) support_force += normal_contrib;
+  }
+  double support_fraction = 0.0;
+  if (vertical_capacity > 1.0e-6) {
+    support_fraction = mju_clip(support_force / vertical_capacity, 0.0, 1.0);
+  }
+
+  double net_force_error_raw[3];
+  mju_sub3(net_force_error_raw, net_grf, grf_target_);
+
+  double net_force_error_normalized[3] = {0, 0, 0};
+  if (support_fraction > 0.05) {
+    // делаем цель «0 0 mg» мягкой: нормируем ошибку на допустимую опорную силу
+    double denom = vertical_capacity > 1.0 ? vertical_capacity : 1.0;
+    for (int i = 0; i < 3; ++i) {
+      net_force_error_normalized[i] = net_force_error_raw[i] / denom;
+    }
+    // плавно отключаем штраф, когда робот почти в полёте
+    mju_scl3(net_force_error_normalized, net_force_error_normalized,
+             support_fraction);
+    mju_copy3(residual + counter, net_force_error_normalized);
   } else {
     mju_zero3(residual + counter);
   }
   counter += 3;
 
-  grf_log << "Референсная net force: " << format_vec(grf_target_) << "\n";
-  grf_log << "Фактическая net force:  " << format_vec(net_grf) << "\n";
-  grf_log << "Ошибка net force:      " << format_vec(net_force_error)
-          << "\n";
+  if (kEnableGrfDebugLog) {
+    grf_log << "Референсная net force: " << format_vec(grf_target_) << "\n";
+    grf_log << "Фактическая net force:  " << format_vec(net_grf) << "\n";
+    grf_log << "Ошибка net force (сырая): "
+            << format_vec(net_force_error_raw) << "\n";
+    grf_log << "Ошибка net force (норм.): "
+            << format_vec(net_force_error_normalized) << "\n";
+  }
 
   for (A1Foot foot : kFootHind) {
     double alignment_residual = 0;
-    std::ostringstream stage_log;
-    stage_log.setf(std::ios::fixed, std::ios::floatfield);
-    stage_log << std::setprecision(3);
-    stage_log << "[GRF] Этапы выбора мотора (" << kFootNames[foot]
-              << ")\n";
-    stage_log << "  Контакт: "
-              << (foot_in_contact[foot] ? "да" : "нет") << "\n";
+  [[maybe_unused]] std::ostringstream stage_log;
+    if (kEnableGrfDebugLog) {
+      stage_log.setf(std::ios::fixed, std::ios::floatfield);
+      stage_log << std::setprecision(3);
+      stage_log << "[GRF] Этапы выбора мотора (" << kFootNames[foot]
+                << ")\n";
+      stage_log << "  Контакт: "
+                << (foot_in_contact[foot] ? "да" : "нет") << "\n";
+    }
     if (foot_in_contact[foot]) {
       double force_norm = mju_norm3(foot_force[foot]);
-      stage_log << "  Норма силы: " << force_norm << "\n";
+      if (kEnableGrfDebugLog) {
+        stage_log << "  Норма силы: " << force_norm << "\n";
+      }
       if (force_norm > kContactForceThreshold) {
         double grf_unit[3];
         mju_copy3(grf_unit, foot_force[foot]);
         mju_scl3(grf_unit, grf_unit, 1.0 / force_norm);
-        stage_log << "  Единичный GRF: " << format_vec(grf_unit) << "\n";
+        if (kEnableGrfDebugLog) {
+          stage_log << "  Единичный GRF: " << format_vec(grf_unit) << "\n";
+        }
         double motor_vec[3];
         bool has_motor =
             MotorVector(foot, contact_point[foot], contact_normal[foot], data,
                          motor_vec);
         if (has_motor) {
-          stage_log << "  Вектор к мотору: " << format_vec(motor_vec)
-                    << "\n";
+          if (kEnableGrfDebugLog) {
+            stage_log << "  Вектор к мотору: " << format_vec(motor_vec)
+                      << "\n";
+          }
           double plane_normal[3];
           bool has_plane = MotorPlaneNormal(foot, data, plane_normal);
-          stage_log << "  Нормаль плоскости моторов: ";
+          if (kEnableGrfDebugLog) {
+            stage_log << "  Нормаль плоскости моторов: ";
+          }
           if (has_plane) {
-            stage_log << format_vec(plane_normal) << "\n";
+            if (kEnableGrfDebugLog) {
+              stage_log << format_vec(plane_normal) << "\n";
+            }
             double grf_proj[3];
             mju_copy3(grf_proj, grf_unit);
             double grf_dot = mju_dot3(grf_proj, plane_normal);
             mju_addToScl3(grf_proj, plane_normal, -grf_dot);
             double grf_proj_norm = mju_norm3(grf_proj);
-            stage_log << "  Проекция GRF: ";
+            if (kEnableGrfDebugLog) {
+              stage_log << "  Проекция GRF: ";
+            }
             if (grf_proj_norm > kContactForceThreshold) {
               mju_scl3(grf_proj, grf_proj, 1.0 / grf_proj_norm);
-              stage_log << format_vec(grf_proj) << "\n";
+              if (kEnableGrfDebugLog) {
+                stage_log << format_vec(grf_proj) << "\n";
+              }
               double motor_proj[3];
               mju_copy3(motor_proj, motor_vec);
               double motor_dot = mju_dot3(motor_proj, plane_normal);
               mju_addToScl3(motor_proj, plane_normal, -motor_dot);
               double motor_proj_norm = mju_norm3(motor_proj);
-              stage_log << "  Проекция мотора: ";
+              if (kEnableGrfDebugLog) {
+                stage_log << "  Проекция мотора: ";
+              }
               if (motor_proj_norm > kContactForceThreshold) {
                 mju_scl3(motor_proj, motor_proj, 1.0 / motor_proj_norm);
-                stage_log << format_vec(motor_proj) << "\n";
+                if (kEnableGrfDebugLog) {
+                  stage_log << format_vec(motor_proj) << "\n";
+                }
                 double cross[3];
                 mju_cross(cross, grf_proj, motor_proj);
                 alignment_residual = mju_norm3(cross);
-                stage_log << "  Векторное произведение: "
-                          << format_vec(cross) << "\n";
+                // масштабируем штраф по силе контакта, чтобы слабые касания не ломали оптимизацию
+                double contact_scale =
+                    mju_tanh(force_norm / (vertical_capacity * 0.25 + 1.0e-6));
+                alignment_residual *= contact_scale;
+                if (kEnableGrfDebugLog) {
+                  stage_log << "  Векторное произведение: "
+                            << format_vec(cross) << "\n";
+                }
               } else {
-                stage_log << "недостаточная норма (" << motor_proj_norm
-                          << ")\n";
+                if (kEnableGrfDebugLog) {
+                  stage_log << "недостаточная норма (" << motor_proj_norm
+                            << ")\n";
+                }
               }
             } else {
-              stage_log << "недостаточная норма (" << grf_proj_norm
-                        << ")\n";
+              if (kEnableGrfDebugLog) {
+                stage_log << "недостаточная норма (" << grf_proj_norm
+                          << ")\n";
+              }
             }
           } else {
-            stage_log << "не найдена\n";
+            if (kEnableGrfDebugLog) {
+              stage_log << "не найдена\n";
+            }
           }
         } else {
-          stage_log << "  Вектор к мотору: не найден\n";
+          if (kEnableGrfDebugLog) {
+            stage_log << "  Вектор к мотору: не найден\n";
+          }
         }
       } else {
-        stage_log << "  Норма силы ниже порога (" << kContactForceThreshold
-                  << ")\n";
+        if (kEnableGrfDebugLog) {
+          stage_log << "  Норма силы ниже порога (" << kContactForceThreshold
+                    << ")\n";
+        }
       }
     } else {
-      stage_log << "  Контакт отсутствует\n";
+      if (kEnableGrfDebugLog) {
+        stage_log << "  Контакт отсутствует\n";
+      }
     }
-    stage_log << "  Итоговый residual: " << alignment_residual << "\n";
-    grf_log << stage_log.str();
+    if (kEnableGrfDebugLog) {
+      stage_log << "  Итоговый residual: " << alignment_residual << "\n";
+      grf_log << stage_log.str();
+    }
     residual[counter++] = alignment_residual;
   }
 
-  std::cout << grf_log.str();
+  if (kEnableGrfDebugLog) {
+    std::cout << grf_log.str();
+  }
 
 
   // sensor dim sanity check
@@ -811,6 +887,7 @@ void QuadrupedFlat::TransitionLocked(mjModel* model, mjData* data) {
   // save mode
   residual_.current_mode_ = static_cast<ResidualFn::A1Mode>(mode);
   residual_.last_transition_time_ = data->time;
+
 }
 
 // colors of visualisation elements drawn in ModifyScene()
@@ -1008,10 +1085,16 @@ void QuadrupedFlat::ResetLocked(const mjModel* model) {
     }
   }
 
-  // compute total mass and GRF target
+  // compute total mass (robot subtree only) and GRF target
   residual_.total_mass_ = 0;
-  for (int i = 0; i < model->nbody; ++i) {
-    residual_.total_mass_ += model->body_mass[i];
+  if (residual_.torso_body_id_ >= 0 &&
+      residual_.torso_body_id_ < model->nbody) {
+    int root_id = model->body_rootid[residual_.torso_body_id_];
+    for (int i = 0; i < model->nbody; ++i) {
+      if (model->body_rootid[i] == root_id) {
+        residual_.total_mass_ += model->body_mass[i];
+      }
+    }
   }
   mju_zero3(residual_.grf_target_);
   if (residual_.total_mass_ > 0) {

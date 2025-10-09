@@ -193,15 +193,13 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python packages for Mujoco
-RUN pip3 install --upgrade pip && \
-    pip3 install mujoco \
-                 numpy \
-                 scipy \
-                 matplotlib \
-                 opencv-python \
-                 pillow \
-                 pyopengl \
-                 glfw
+RUN apt-get update && apt-get install -y python3-venv python3-pip && \
+    python3 -m venv /opt/venv && \
+    . /opt/venv/bin/activate && \
+    pip install --upgrade pip && \
+    pip install mujoco numpy scipy matplotlib opencv-python pillow pyopengl glfw
+
+ENV PATH="/opt/venv/bin:$PATH"
 #! ==============================================================
 
 
@@ -221,7 +219,8 @@ RUN  apt-get update && apt-get install -y \
     libxinerama-dev \
     libxcursor-dev \
     libxi-dev \
-    mesa-utils
+    mesa-utils \
+    ninja-build
     
     
 # Set working directory
