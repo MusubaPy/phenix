@@ -18,12 +18,116 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <limits>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include <mujoco/mujoco.h>
 #include "mjpc/task.h"
 #include "mjpc/utilities.h"
+
+namespace {
+constexpr double kForceThreshold = 1e-6;
+constexpr double kPlaneProjectionEps = 1e-8;
+constexpr int kDebugWidth = 10;
+constexpr double kDebugPrintInterval = 0.5;   // seconds between debug rows
+constexpr int kDebugHeaderRepeat = 20;        // reprint header every N rows
+
+struct FootContactInfo {
+  double force[3] = {0.0, 0.0, 0.0};
+  double normal[3] = {0.0, 0.0, 0.0};
+  double point[3] = {0.0, 0.0, 0.0};
+  double weight = 0.0;
+  bool in_contact = false;
+};
+
+constexpr const char* kFootLabels[4] = {"FL", "HL", "FR", "HR"};
+
+std::mutex& DebugMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::string BuildDebugHeader() {
+  std::ostringstream oss;
+  std::vector<std::string> headers = {"time", "net_x", "net_y", "net_z"};
+  for (const char* label : kFootLabels) {
+    headers.push_back(std::string(label) + "_fx");
+    headers.push_back(std::string(label) + "_fy");
+    headers.push_back(std::string(label) + "_fz");
+  }
+  headers.push_back("align_HL");
+  headers.push_back("align_HR");
+
+  auto print_separator = [&]() {
+    oss << '+';
+    for (size_t i = 0; i < headers.size(); ++i) {
+      oss << std::string(kDebugWidth, '-') << '+';
+    }
+    oss << '\n';
+  };
+
+  print_separator();
+  oss << '|';
+  for (const std::string& header : headers) {
+    oss << std::setw(kDebugWidth) << std::left << header << '|';
+  }
+  oss << '\n';
+  print_separator();
+  return oss.str();
+}
+
+std::string BuildDebugRow(double time, const double net_force[3],
+                          const FootContactInfo* contact_info,
+                          const double hind_alignment[2]) {
+  std::ostringstream oss;
+  oss << '|'
+      << std::setw(kDebugWidth) << std::right << std::fixed
+      << std::setprecision(3) << time << '|'
+      << std::setw(kDebugWidth) << net_force[0] << '|'
+      << std::setw(kDebugWidth) << net_force[1] << '|'
+      << std::setw(kDebugWidth) << net_force[2] << '|';
+
+  for (size_t idx = 0; idx < 4; ++idx) {
+    const FootContactInfo& info = contact_info[idx];
+    oss << std::setw(kDebugWidth) << info.force[0] << '|'
+        << std::setw(kDebugWidth) << info.force[1] << '|'
+        << std::setw(kDebugWidth) << info.force[2] << '|';
+  }
+  oss << std::setw(kDebugWidth) << hind_alignment[0] << '|'
+      << std::setw(kDebugWidth) << hind_alignment[1] << '|'
+      << '\n';
+  return oss.str();
+}
+
+void ProjectOntoPlane(double out[3], const double v[3],
+                      const double normal[3]) {
+  double n[3] = {normal[0], normal[1], normal[2]};
+  double norm = mju_norm3(n);
+  if (norm < kPlaneProjectionEps) {
+    out[0] = out[1] = out[2] = 0.0;
+    return;
+  }
+  mju_scl3(n, n, 1.0 / norm);
+  double projection = mju_dot3(v, n);
+  out[0] = v[0] - projection * n[0];
+  out[1] = v[1] - projection * n[1];
+  out[2] = v[2] - projection * n[2];
+}
+
+double AngleBetween(const double a[3], const double b[3]) {
+  double norm_a = mju_norm3(a);
+  double norm_b = mju_norm3(b);
+  if (norm_a < kPlaneProjectionEps || norm_b < kPlaneProjectionEps) {
+    return 0.0;
+  }
+  double dot = mju_dot3(a, b) / (norm_a * norm_b);
+  dot = mju_clip(dot, -1.0, 1.0);
+  return std::acos(dot);
+}
+}  // namespace
 
 namespace mjpc {
 std::string QuadrupedHill::XmlPath() const {
@@ -50,10 +154,12 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
   double avg_foot_pos[3];
   AverageFootPos(avg_foot_pos, foot_pos);
 
+  FootContactInfo contact_info[kNumFoot];
+  double net_grf[3] = {0.0, 0.0, 0.0};
+
   double* torso_xmat = data->xmat + 9*torso_body_id_;
   double* goal_pos = data->mocap_pos + 3*goal_mocap_id_;
   double* compos = SensorByName(model, data, "torso_subtreecom");
-  if (!compos) return;
 
 
   // ---------- Upright ----------
@@ -154,15 +260,99 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
 
   // ---------- Balance ----------
   double* comvel = SensorByName(model, data, "torso_subtreelinvel");
-  if (!comvel) return;
-  double* comacc = SensorByName(model, data, "torso_subtreelinacc");
   double capture_point[3];
   double fall_time = mju_sqrt(2*height_goal / 9.81);
   mju_addScl3(capture_point, compos, comvel, fall_time);
   residual[counter++] = capture_point[0] - avg_foot_pos[0];
   residual[counter++] = capture_point[1] - avg_foot_pos[1];
 
-    UpdateGrfTarget(model, data, comvel, comacc);
+  // ---------- Ground reaction force collection ----------
+  for (int i = 0; i < data->ncon; ++i) {
+    const mjContact& contact = data->contact[i];
+    int foot_index = -1;
+    double sign = 1.0;
+    for (A1Foot candidate : kFootAll) {
+      if (foot_geom_id_[candidate] == contact.geom1) {
+        foot_index = static_cast<int>(candidate);
+        break;
+      }
+    }
+    if (foot_index < 0) {
+      for (A1Foot candidate : kFootAll) {
+        if (foot_geom_id_[candidate] == contact.geom2) {
+          foot_index = static_cast<int>(candidate);
+          sign = -1.0;
+          break;
+        }
+      }
+    }
+    if (foot_index < 0) {
+      continue;
+    }
+
+    mjtNum contact_force[6];
+    mj_contactForce(model, data, i, contact_force);
+    mjtNum local_force[3] = {contact_force[0], contact_force[1],
+                             contact_force[2]};
+    mjtNum world_force_tmp[3];
+    mju_mulMatVec(world_force_tmp, contact.frame, local_force, 3, 3);
+    double world_force[3] = {static_cast<double>(world_force_tmp[0]),
+                             static_cast<double>(world_force_tmp[1]),
+                             static_cast<double>(world_force_tmp[2])};
+    if (sign < 0) {
+      world_force[0] *= -1.0;
+      world_force[1] *= -1.0;
+      world_force[2] *= -1.0;
+    }
+
+    FootContactInfo& info = contact_info[foot_index];
+    mju_addTo3(info.force, world_force);
+    double force_magnitude = mju_norm3(world_force);
+    if (force_magnitude > kForceThreshold) {
+      info.in_contact = true;
+    }
+    info.weight += force_magnitude;
+    if (force_magnitude > 0.0) {
+      double contact_pos[3] = {
+          static_cast<double>(contact.pos[0]),
+          static_cast<double>(contact.pos[1]),
+          static_cast<double>(contact.pos[2])};
+      mju_addToScl3(info.point, contact_pos, force_magnitude);
+    }
+
+    double normal_world[3] = {static_cast<double>(contact.frame[6]),
+                              static_cast<double>(contact.frame[7]),
+                              static_cast<double>(contact.frame[8])};
+    if (sign < 0) {
+      normal_world[0] *= -1.0;
+      normal_world[1] *= -1.0;
+      normal_world[2] *= -1.0;
+    }
+    mju_addTo3(info.normal, normal_world);
+    mju_addTo3(net_grf, world_force);
+  }
+
+  for (A1Foot foot : kFootAll) {
+    FootContactInfo& info = contact_info[foot];
+    if (info.weight > kForceThreshold) {
+      double inv = 1.0 / info.weight;
+      mju_scl3(info.point, info.point, inv);
+    } else {
+      info.point[0] = foot_pos[foot][0];
+      info.point[1] = foot_pos[foot][1];
+      info.point[2] = foot_pos[foot][2];
+    }
+    if (mju_norm3(info.force) < kForceThreshold) {
+      info.in_contact = false;
+    }
+    double norm = mju_norm3(info.normal);
+    if (norm > kPlaneProjectionEps) {
+      mju_scl3(info.normal, info.normal, 1.0 / norm);
+    } else {
+      info.normal[0] = info.normal[1] = info.normal[2] = 0.0;
+    }
+  }
+
 
   // ---------- Effort ----------
   mju_scl(residual + counter, data->actuator_force, 2e-2, model->nu);
@@ -229,757 +419,144 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
   mju_copy3(residual + counter, SensorByName(model, data, "torso_angmom"));
   counter +=3;
 
-
-  // ---------- Ground reaction forces ----------
-  double foot_force_contact[kNumFoot][3];
-  double foot_force[kNumFoot][3];
-  double contact_point[kNumFoot][3];
-  double contact_normal[kNumFoot][3];
-  double max_normal_component[kNumFoot] = {0};
-  bool foot_in_contact[kNumFoot] = {false};
-  for (A1Foot foot : kFootAll) {
-  mju_zero3(foot_force_contact[foot]);
-  mju_zero3(foot_force[foot]);
-    mju_zero3(contact_point[foot]);
-    mju_zero3(contact_normal[foot]);
-  }
-
-  constexpr bool kEnableGrfDebugLog = false;
-
-  [[maybe_unused]] std::ostringstream grf_log;
-  if (kEnableGrfDebugLog) {
-    grf_log.setf(std::ios::fixed, std::ios::floatfield);
-    grf_log << std::setprecision(3);
-  }
-  [[maybe_unused]] const auto format_vec = [](const double v[3]) -> std::string {
-    std::ostringstream vec_stream;
-    vec_stream.setf(std::ios::fixed, std::ios::floatfield);
-    vec_stream << std::setprecision(3)
-               << "[" << std::setw(9) << v[0] << ", "
-               << std::setw(9) << v[1] << ", "
-               << std::setw(9) << v[2] << "]";
-    return vec_stream.str();
-  };
-
-  const double grf_weight =
-      (grf_cost_id_ >= 0 &&
-       grf_cost_id_ < static_cast<int>(weight_.size()))
-          ? weight_[grf_cost_id_]
-          : 0.0;
-  const double hind_weight = (hind_grf_cost_id_ >= 0 &&
-                              hind_grf_cost_id_ <
-                                  static_cast<int>(weight_.size()))
-                                 ? weight_[hind_grf_cost_id_]
-                                 : 0.0;
-
-  auto weight_scale = [&](double weight_value) {
-    if (weight_value <= 0.0) {
-      return 0.0;
-    }
-    double denom = weight_value + kGrfWeightSoftReference;
-    if (denom <= 0.0) {
-      return 0.0;
-    }
-    double ratio = weight_value / denom;
-    ratio = mju_clip(ratio, 0.0, 1.0);
-    return std::sqrt(ratio);
-  };
-
-  const double grf_weight_scale = weight_scale(grf_weight);
-  const double hind_weight_scale = weight_scale(hind_weight);
-  const double net_force_weight_scale =
-      std::max(grf_weight_scale, hind_weight_scale);
-
-  for (int i = 0; i < data->ncon; ++i) {
-    const mjContact& contact = data->contact[i];
-    A1Foot contact_foot = kNumFoot;
-    for (A1Foot foot : kFootAll) {
-      if (contact.geom1 == foot_geom_id_[foot] ||
-          contact.geom2 == foot_geom_id_[foot]) {
-        contact_foot = foot;
-        break;
-      }
-    }
-    if (contact_foot == kNumFoot) continue;
-
-    mjtNum force_local[6];
-    mj_contactForce(model, data, i, force_local);
-    double force_world[3];
-    mju_mulMatVec(force_world, contact.frame, force_local, 3, 3);
-
-    bool foot_is_geom1 = contact.geom1 == foot_geom_id_[contact_foot];
-    double applied_force[3];
-    if (foot_is_geom1) {
-      mju_copy3(applied_force, force_world);
-    } else {
-      applied_force[0] = -force_world[0];
-      applied_force[1] = -force_world[1];
-      applied_force[2] = -force_world[2];
-    }
-  mju_addTo3(foot_force_contact[contact_foot], applied_force);
-
-    double normal_world[3] = {contact.frame[6], contact.frame[7],
-                              contact.frame[8]};
-    if (foot_is_geom1) {
-      normal_world[0] *= -1;
-      normal_world[1] *= -1;
-      normal_world[2] *= -1;
-    }
-
-    double normal_component = mju_abs(mju_dot3(applied_force, normal_world));
-    if (normal_component > max_normal_component[contact_foot]) {
-      max_normal_component[contact_foot] = normal_component;
-      foot_in_contact[contact_foot] =
-          normal_component > kContactForceThreshold;
-      double normal_norm = mju_norm3(normal_world);
-      if (normal_norm > kContactForceThreshold) {
-        mju_scl3(contact_normal[contact_foot], normal_world,
-                 1.0 / normal_norm);
-      } else {
-        mju_zero3(contact_normal[contact_foot]);
-      }
-      mju_copy3(contact_point[contact_foot], contact.pos);
-    }
-  }
-
-  // prefer body-level contact wrench (`cfrc_ext`) for magnitude stability,
-  // but fall back to accumulated contact forces if unavailable.
-  for (A1Foot foot : kFootAll) {
-    int geom_id = foot_geom_id_[foot];
-    int body_id = (geom_id >= 0 && geom_id < model->ngeom)
-                      ? model->geom_bodyid[geom_id]
-                      : -1;
-    if (body_id >= 0 && body_id < model->nbody) {
-      const double* cfrc = data->cfrc_ext + 6 * body_id;
-      // cfrc_ext stores wrench in rotation:translation order, grab the force.
-      mju_copy3(foot_force[foot], cfrc + 3);
-    }
-  double contact_norm = mju_norm3(foot_force_contact[foot]);
-  if (mju_norm3(foot_force[foot]) < kContactForceThreshold &&
-    contact_norm > 0.0) {
-      mju_copy3(foot_force[foot], foot_force_contact[foot]);
-    }
-  }
-
-  const double gravity_norm = mju_norm3(model->opt.gravity);
-  double foot_force_limit = total_mass_ * (gravity_norm + kDesiredAccelLimit);
-  if (!std::isfinite(foot_force_limit) || foot_force_limit <= 0.0) {
-    foot_force_limit = 1.0e3;
-  }
-  auto sanitize_force = [&](double force_vec[3]) {
-    for (int axis = 0; axis < 3; ++axis) {
-      if (!std::isfinite(force_vec[axis])) {
-        force_vec[axis] = 0.0;
-      }
-    }
-    double norm = mju_norm3(force_vec);
-    if (!std::isfinite(norm)) {
-      mju_zero3(force_vec);
-      return;
-    }
-    if (norm > foot_force_limit && foot_force_limit > 1.0e-6) {
-      mju_scl3(force_vec, force_vec, foot_force_limit / norm);
-    }
-  };
-  for (A1Foot foot : kFootAll) {
-    sanitize_force(foot_force[foot]);
-  }
-
-  double dt_grf = data->time - last_grf_update_time_;
-  bool reset_grf_filter = (last_grf_update_time_ < 0.0) ||
-                          (dt_grf <= 0.0) ||
-                          (dt_grf > kDesiredAccelMaxDt);
-  double alpha_grf = reset_grf_filter
-                         ? 1.0
-                         : 1.0 - std::exp(-dt_grf / kGrfFilterTimeConstant);
-  alpha_grf = mju_clip(alpha_grf, 0.0, 1.0);
-  double decay_grf = 1.0 - alpha_grf;
-
-  bool effective_contact[kNumFoot] = {false};
-  for (A1Foot foot : kFootAll) {
-    if (foot_in_contact[foot]) {
-      if (reset_grf_filter) {
-        mju_copy3(filtered_foot_force_[foot], foot_force[foot]);
-        mju_copy3(filtered_contact_normal_[foot], contact_normal[foot]);
-      } else {
-        for (int axis = 0; axis < 3; ++axis) {
-          filtered_foot_force_[foot][axis] +=
-              alpha_grf *
-              (foot_force[foot][axis] - filtered_foot_force_[foot][axis]);
-          filtered_contact_normal_[foot][axis] +=
-              alpha_grf *
-              (contact_normal[foot][axis] -
-               filtered_contact_normal_[foot][axis]);
-        }
-        double normal_norm = mju_norm3(filtered_contact_normal_[foot]);
-        if (normal_norm > kContactForceThreshold) {
-          mju_scl3(filtered_contact_normal_[foot],
-                   filtered_contact_normal_[foot], 1.0 / normal_norm);
-        } else {
-          mju_zero3(filtered_contact_normal_[foot]);
-        }
-      }
-    } else {
-      if (reset_grf_filter) {
-        mju_zero3(filtered_foot_force_[foot]);
-        mju_zero3(filtered_contact_normal_[foot]);
-      } else {
-        mju_scl3(filtered_foot_force_[foot], filtered_foot_force_[foot],
-                 decay_grf);
-        if (mju_norm3(filtered_foot_force_[foot]) <
-            0.5 * kSupportForceActivation) {
-          mju_zero3(filtered_foot_force_[foot]);
-          mju_zero3(filtered_contact_normal_[foot]);
-        }
-      }
-    }
-    sanitize_force(filtered_foot_force_[foot]);
-    double filtered_norm = mju_norm3(filtered_foot_force_[foot]);
-    effective_contact[foot] =
-        foot_in_contact[foot] || filtered_norm > kSupportForceActivation;
-  }
-  last_grf_update_time_ = data->time;
-
-  double net_grf[3] = {0, 0, 0};
-  bool any_support = false;
-  for (A1Foot foot : kFootAll) {
-    mju_addTo3(net_grf, filtered_foot_force_[foot]);
-    any_support = any_support || effective_contact[foot];
-  }
-
-  const int label_width = 8;
-  const int value_width = 12;
-  [[maybe_unused]] auto print_separator = [&]() {
-    grf_log << '+' << std::string(label_width + 2, '-');
-    for (int axis = 0; axis < 3; ++axis) {
-      grf_log << '+' << std::string(value_width + 2, '-');
-    }
-    grf_log << "+\n";
-  };
-
-  if (kEnableGrfDebugLog) {
-    grf_log << "\n[GRF] Таблица сил реакции опоры (Н)\n";
-    print_separator();
-    grf_log << "| " << std::setw(label_width) << std::left << "Нога    ";
-    for (const char* axis_name : {"Fx", "Fy", "Fz"}) {
-      grf_log << " | " << std::setw(value_width) << std::left << axis_name;
-    }
-    grf_log << " |\n";
-    print_separator();
-    for (A1Foot foot : kFootAll) {
-      grf_log << "| " << std::setw(label_width) << std::left
-              << kFootNames[foot];
-      grf_log << std::right;
-      for (int axis = 0; axis < 3; ++axis) {
-        grf_log << " | " << std::setw(value_width) << foot_force[foot][axis];
-      }
-      grf_log << " |\n";
-      grf_log << std::left;
-    }
-    print_separator();
-  }
-
-  const double vertical_capacity = total_mass_ * gravity_norm;
-
-  double support_force = 0.0;
-  for (A1Foot foot : kFootAll) {
-    if (!effective_contact[foot]) continue;
-    const double* force_eval = filtered_foot_force_[foot];
-    double normal_eval[3];
-    if (mju_norm3(filtered_contact_normal_[foot]) > kContactForceThreshold) {
-      mju_copy3(normal_eval, filtered_contact_normal_[foot]);
-    } else {
-      mju_copy3(normal_eval, contact_normal[foot]);
-    }
-    double normal_norm = mju_norm3(normal_eval);
-    if (normal_norm <= kContactForceThreshold) continue;
-    mju_scl3(normal_eval, normal_eval, 1.0 / normal_norm);
-    double normal_contrib = mju_dot3(force_eval, normal_eval);
-    if (normal_contrib > 0.0) support_force += normal_contrib;
-  }
-  double support_fraction = 0.0;
-  if (vertical_capacity > 1.0e-6) {
-    support_fraction = mju_clip(support_force / vertical_capacity, 0.0, 1.0);
-  }
-
-  double planar_scale = 1.0;
-  double planar_speed = 0.0;
-  if (comvel != nullptr) {
-    planar_speed = std::hypot(comvel[0], comvel[1]);
-  }
-  if (kPlanarSpeedHigh > kPlanarSpeedLow) {
-    double speed_alpha =
-        (planar_speed - kPlanarSpeedLow) /
-        (kPlanarSpeedHigh - kPlanarSpeedLow);
-    speed_alpha = mju_clip(speed_alpha, 0.0, 1.0);
-    double speed_scale = 1.0 - (1.0 - kPlanarSpeedFloor) * speed_alpha;
-    planar_scale = speed_scale;
-  }
-  if (gait == kGaitTrot || gait == kGaitCanter || gait == kGaitGallop) {
-    planar_scale *= kDynamicGaitPlanarScale;
-  }
-  planar_scale = mju_clip(planar_scale, kNetForceMinScale, 1.0);
-
-  double support_gate = support_fraction;
-  if (kSupportResidualMinFraction > 1.0e-9) {
-    support_gate /= kSupportResidualMinFraction;
-  }
-  support_gate = mju_clip(support_gate, 0.0, 1.0);
-  double grf_target_effective[3];
-  mju_copy3(grf_target_effective, grf_target_);
-  mju_scl3(grf_target_effective, grf_target_effective,
-           mju_clip(support_fraction, 0.0, 1.0));
-
-  double net_force_error_raw[3];
-  mju_sub3(net_force_error_raw, net_grf, grf_target_effective);
-
-  double net_force_error_normalized[3] = {0, 0, 0};
-  if (support_gate > 0.0 && net_force_weight_scale > 0.0) {
-    double denom = vertical_capacity > 1.0 ? vertical_capacity : 1.0;
-    for (int i = 0; i < 3; ++i) {
-      net_force_error_normalized[i] = net_force_error_raw[i] / denom;
-    }
-    mju_scl3(net_force_error_normalized, net_force_error_normalized,
-             support_gate);
-    net_force_error_normalized[0] *= planar_scale;
-    net_force_error_normalized[1] *= planar_scale;
-    mju_scl3(net_force_error_normalized, net_force_error_normalized,
-             net_force_weight_scale);
-    mju_copy3(residual + counter, net_force_error_normalized);
-  } else {
-    mju_zero3(residual + counter);
-  }
+  // ---------- Net ground reaction force ----------
+  double expected_contact[3] = {model->opt.gravity[0], model->opt.gravity[1],
+                                model->opt.gravity[2]};
+  mju_scl3(expected_contact, expected_contact, -total_mass_);
+  double net_residual[3];
+  mju_sub3(net_residual, net_grf, expected_contact);
+  mju_copy(residual + counter, net_residual, 3);
   counter += 3;
 
-  if (kEnableGrfDebugLog) {
-    grf_log << "Референсная net force: " << format_vec(grf_target_) << "\n";
-    grf_log << "Фактическая net force:  " << format_vec(net_grf) << "\n";
-    grf_log << "Ошибка net force (сырая): "
-            << format_vec(net_force_error_raw) << "\n";
-    grf_log << "Ошибка net force (норм.): "
-            << format_vec(net_force_error_normalized) << "\n";
-  }
-
-  double hind_alignment_residual[kNumFoot] = {0, 0, 0, 0};
-  for (A1Foot foot : kFootHind) {
-    double alignment_residual = 0;
-    if (hind_weight_scale <= 0.0) {
-      hind_alignment_residual[foot] = 0.0;
-      residual[counter++] = 0.0;
+  // ---------- Hind leg GRF alignment ----------
+  double hind_alignment[2] = {0.0, 0.0};
+  for (int hind_idx = 0; hind_idx < 2; ++hind_idx) {
+    A1Foot foot = kFootHind[hind_idx];
+    FootContactInfo& info = contact_info[foot];
+    if (!info.in_contact) {
+      hind_alignment[hind_idx] = 0.0;
       continue;
     }
-  [[maybe_unused]] std::ostringstream stage_log;
-    if (kEnableGrfDebugLog) {
-      stage_log.setf(std::ios::fixed, std::ios::floatfield);
-      stage_log << std::setprecision(3);
-      stage_log << "[GRF] Этапы выбора мотора (" << kFootNames[foot]
-                << ")\n";
-      stage_log << "  Контакт: "
-                << (foot_in_contact[foot] ? "да" : "нет") << "\n";
+
+    int abduction_joint = abduction_joint_id_[foot];
+    int hip_joint = hip_joint_id_[foot];
+    int knee_joint = knee_joint_id_[foot];
+    if (abduction_joint < 0 || hip_joint < 0 || knee_joint < 0) {
+      hind_alignment[hind_idx] = 0.0;
+      continue;
     }
-    if (foot_in_contact[foot] && effective_contact[foot]) {
-      double force_norm = mju_norm3(filtered_foot_force_[foot]);
-      if (kEnableGrfDebugLog) {
-        stage_log << "  Норма силы: " << force_norm << "\n";
+
+    const mjtNum* abduction_anchor_ptr =
+        data->xanchor + 3 * model->jnt_dofadr[abduction_joint];
+    const mjtNum* hip_anchor_ptr =
+        data->xanchor + 3 * model->jnt_dofadr[hip_joint];
+    const mjtNum* knee_anchor_ptr =
+        data->xanchor + 3 * model->jnt_dofadr[knee_joint];
+    double anchors[3][3];
+    mju_copy3(anchors[0], abduction_anchor_ptr);
+    mju_copy3(anchors[1], hip_anchor_ptr);
+    mju_copy3(anchors[2], knee_anchor_ptr);
+
+    double v1[3];
+    double v2[3];
+    mju_sub3(v1, anchors[1], anchors[0]);
+    mju_sub3(v2, anchors[2], anchors[0]);
+    double plane_normal[3];
+    mju_cross(plane_normal, v1, v2);
+    if (mju_norm3(plane_normal) < kPlaneProjectionEps) {
+      hind_alignment[hind_idx] = 0.0;
+      continue;
+    }
+
+    if (mju_dot3(plane_normal, info.normal) < 0) {
+      mju_scl3(plane_normal, plane_normal, -1.0);
+    }
+
+    double normal_proj[3];
+    ProjectOntoPlane(normal_proj, info.normal, plane_normal);
+    if (mju_norm3(normal_proj) < kPlaneProjectionEps) {
+      hind_alignment[hind_idx] = 0.0;
+      continue;
+    }
+
+    double best_motor_proj[3] = {0.0, 0.0, 0.0};
+    double smallest_angle = mjMAXVAL;
+    for (int motor = 0; motor < 3; ++motor) {
+      double motor_vec[3];
+      mju_sub3(motor_vec, anchors[motor], info.point);
+      double motor_proj[3];
+      ProjectOntoPlane(motor_proj, motor_vec, plane_normal);
+      if (mju_norm3(motor_proj) < kPlaneProjectionEps) {
+        continue;
       }
-      if (force_norm > kContactForceThreshold) {
-        double grf_unit[3];
-        mju_copy3(grf_unit, filtered_foot_force_[foot]);
-        mju_scl3(grf_unit, grf_unit, 1.0 / force_norm);
-        if (kEnableGrfDebugLog) {
-          stage_log << "  Единичный GRF: " << format_vec(grf_unit) << "\n";
-        }
-        double motor_vec[3];
-        bool has_motor =
-            MotorVector(foot, contact_point[foot], contact_normal[foot], data,
-                         motor_vec);
-        if (has_motor) {
-          if (kEnableGrfDebugLog) {
-            stage_log << "  Вектор к мотору: " << format_vec(motor_vec)
-                      << "\n";
-          }
-          double plane_normal[3];
-          bool has_plane = MotorPlaneNormal(foot, data, plane_normal);
-          if (kEnableGrfDebugLog) {
-            stage_log << "  Нормаль плоскости моторов: ";
-          }
-          if (has_plane) {
-            if (kEnableGrfDebugLog) {
-              stage_log << format_vec(plane_normal) << "\n";
-            }
-            double grf_proj[3];
-            mju_copy3(grf_proj, grf_unit);
-            double grf_dot = mju_dot3(grf_proj, plane_normal);
-            mju_addToScl3(grf_proj, plane_normal, -grf_dot);
-            double grf_proj_norm = mju_norm3(grf_proj);
-            if (kEnableGrfDebugLog) {
-              stage_log << "  Проекция GRF: ";
-            }
-            if (grf_proj_norm > kContactForceThreshold) {
-              mju_scl3(grf_proj, grf_proj, 1.0 / grf_proj_norm);
-              if (kEnableGrfDebugLog) {
-                stage_log << format_vec(grf_proj) << "\n";
-              }
-              double motor_proj[3];
-              mju_copy3(motor_proj, motor_vec);
-              double motor_dot = mju_dot3(motor_proj, plane_normal);
-              mju_addToScl3(motor_proj, plane_normal, -motor_dot);
-              double motor_proj_norm = mju_norm3(motor_proj);
-              if (kEnableGrfDebugLog) {
-                stage_log << "  Проекция мотора: ";
-              }
-              if (motor_proj_norm > kContactForceThreshold) {
-                mju_scl3(motor_proj, motor_proj, 1.0 / motor_proj_norm);
-                if (kEnableGrfDebugLog) {
-                  stage_log << format_vec(motor_proj) << "\n";
-                }
-                double cross[3];
-                mju_cross(cross, grf_proj, motor_proj);
-                alignment_residual = mju_norm3(cross);
-                // масштабируем штраф по силе контакта, чтобы слабые касания не ломали оптимизацию
-                double contact_scale =
-                    mju_tanh(force_norm / (vertical_capacity * 0.25 + 1.0e-6));
-                alignment_residual *= contact_scale;
-                if (kEnableGrfDebugLog) {
-                  stage_log << "  Векторное произведение: "
-                            << format_vec(cross) << "\n";
-                }
-              } else {
-                if (kEnableGrfDebugLog) {
-                  stage_log << "недостаточная норма (" << motor_proj_norm
-                            << ")\n";
-                }
-              }
-            } else {
-              if (kEnableGrfDebugLog) {
-                stage_log << "недостаточная норма (" << grf_proj_norm
-                          << ")\n";
-              }
-            }
-          } else {
-            if (kEnableGrfDebugLog) {
-              stage_log << "не найдена\n";
-            }
-          }
-        } else {
-          if (kEnableGrfDebugLog) {
-            stage_log << "  Вектор к мотору: не найден\n";
-          }
-        }
-      } else {
-        if (kEnableGrfDebugLog) {
-          stage_log << "  Норма силы ниже порога (" << kContactForceThreshold
-                    << ")\n";
-        }
-      }
-    } else {
-      if (kEnableGrfDebugLog) {
-        stage_log << "  Контакт отсутствует\n";
+      double angle = AngleBetween(normal_proj, motor_proj);
+      if (angle < smallest_angle) {
+        smallest_angle = angle;
+        mju_copy3(best_motor_proj, motor_proj);
       }
     }
-    if (kEnableGrfDebugLog) {
-      stage_log << "  Итоговый residual: " << alignment_residual << "\n";
-      grf_log << stage_log.str();
+    if (smallest_angle == mjMAXVAL) {
+      hind_alignment[hind_idx] = 0.0;
+      continue;
     }
-    double hind_scale = mju_max(planar_scale, kHindAlignmentMinScale);
-    alignment_residual *= hind_scale;
-    alignment_residual *= hind_weight_scale;
-    hind_alignment_residual[foot] = alignment_residual;
-    residual[counter++] = alignment_residual;
-  }
 
-  bool debug_logging = false;
-  if (debug_log_param_id_ >= 0 &&
-      debug_log_param_id_ < static_cast<int>(parameters_.size())) {
-    debug_logging = parameters_[debug_log_param_id_] > 0.5;
-  }
-  if (debug_logging) {
-    double interval = kDebugLogInterval;
-    if (last_debug_print_time_ < 0.0 ||
-        data->time - last_debug_print_time_ >= interval) {
-      last_debug_print_time_ = data->time;
-      static const char* const kModeNames[] = {
-          "Quadruped", "Biped", "Walk", "Scramble", "Flip"};
-      static const char* const kGaitNames[] = {
-          "Stand", "Walk", "Trot", "Canter", "Gallop"};
-      const char* mode_name =
-          (current_mode_ >= 0 && current_mode_ < kNumMode)
-              ? kModeNames[current_mode_]
-              : "Unknown";
-      const char* gait_name = (gait >= 0 && gait < kNumGait)
-                                  ? kGaitNames[gait]
-                                  : "Unknown";
-      std::ostringstream dbg;
-      dbg.setf(std::ios::fixed, std::ios::floatfield);
-      dbg << std::setprecision(3);
-      dbg << "[GRF DEBUG] t=" << data->time << " mode=" << mode_name
-          << " gait=" << gait_name << " planar_speed=" << planar_speed
-          << " support=" << support_fraction
-          << " planar_scale=" << planar_scale
-          << " weight(GRF)=" << grf_weight
-      << " weight_scale(GRF)=" << grf_weight_scale
-      << " weight(HindAlign)=" << hind_weight
-      << " weight_scale(HindAlign)=" << hind_weight_scale << "\n";
-      dbg << "  target=" << format_vec(grf_target_)
-          << " net=" << format_vec(net_grf)
-          << " error=" << format_vec(net_force_error_raw) << "\n";
-
-  double weighted_terms[mjpc::kMaxCostTerms];
-  double raw_terms[mjpc::kMaxCostTerms];
-  std::fill(weighted_terms, weighted_terms + mjpc::kMaxCostTerms, 0.0);
-  std::fill(raw_terms, raw_terms + mjpc::kMaxCostTerms, 0.0);
-      CostTerms(weighted_terms, residual, /*weighted=*/true);
-      CostTerms(raw_terms, residual, /*weighted=*/false);
-      double total_objective = 0.0;
-      for (int term = 0; term < num_term_; ++term) {
-        if (std::isfinite(weighted_terms[term])) {
-          total_objective += weighted_terms[term];
-        }
-      }
-      auto cost_term_name = [&](int term_index) -> std::string {
-        if (term_index >= 0 &&
-            term_index < static_cast<int>(task_->weight_names.size()) &&
-            !task_->weight_names[term_index].empty()) {
-          return task_->weight_names[term_index];
-        }
-        std::ostringstream name_stream;
-        name_stream << "term[" << term_index << "]";
-        return name_stream.str();
-      };
-      dbg << "  objective_total=" << total_objective << "\n";
-      dbg << "  cost_impact:";
-      if (num_term_ == 0) {
-        dbg << " <no cost terms detected>";
-      }
-      dbg << "\n";
-      for (int term = 0; term < num_term_; ++term) {
-        double weighted_cost = weighted_terms[term];
-        double raw_cost = raw_terms[term];
-        double weight_value =
-            (term >= 0 && term < static_cast<int>(weight_.size()))
-                ? weight_[term]
-                : 0.0;
-        if (!std::isfinite(weighted_cost) && !std::isfinite(raw_cost)) {
-          continue;
-        }
-        if (!std::isfinite(weighted_cost)) {
-          weighted_cost = 0.0;
-        }
-        if (!std::isfinite(raw_cost)) {
-          raw_cost = 0.0;
-        }
-        double share = 0.0;
-        if (total_objective > 1.0e-9) {
-          share = weighted_cost / total_objective;
-        }
-        dbg << "    " << cost_term_name(term)
-            << ": weighted=" << weighted_cost
-            << " raw=" << raw_cost
-            << " weight=" << weight_value
-            << " share=" << share * 100.0 << "%\n";
-      }
-      for (A1Foot foot : kFootAll) {
-        double force_norm = mju_norm3(filtered_foot_force_[foot]);
-        dbg << "  " << kFootNames[foot]
-            << " contact=" << (effective_contact[foot] ? "Y" : "N")
-            << " raw_contact=" << (foot_in_contact[foot] ? "Y" : "N")
-            << " |f|=" << force_norm
-            << " f=" << format_vec(filtered_foot_force_[foot]) << "\n";
-      }
-      for (A1Foot foot : kFootHind) {
-        dbg << "    hind_align[" << kFootNames[foot]
-            << "]=" << hind_alignment_residual[foot] << "\n";
-      }
-      dbg << std::flush;
-      std::cout << dbg.str();
+    double grf_proj[3];
+    ProjectOntoPlane(grf_proj, info.force, plane_normal);
+    if (mju_norm3(grf_proj) < kPlaneProjectionEps) {
+      hind_alignment[hind_idx] = 0.0;
+      continue;
     }
+
+    hind_alignment[hind_idx] = AngleBetween(grf_proj, best_motor_proj);
   }
 
-  if (kEnableGrfDebugLog) {
-    std::cout << grf_log.str();
+  bool debug_enabled =
+      debug_grf_param_id_ >= 0 && parameters_[debug_grf_param_id_] > 0.5;
+  if (debug_enabled) {
+    bool time_reset = data->time < debug_last_print_time_;
+    double time_since_last = data->time - debug_last_print_time_;
+    bool should_print = time_reset || !debug_header_printed_ ||
+                        time_since_last >= kDebugPrintInterval;
+
+    if (should_print) {
+      std::lock_guard<std::mutex> lock(DebugMutex());
+      bool print_header = !debug_header_printed_ ||
+                          (debug_print_count_ % kDebugHeaderRepeat) == 0;
+      if (print_header) {
+        std::cout << BuildDebugHeader();
+        debug_header_printed_ = true;
+      }
+      std::cout << BuildDebugRow(data->time, net_grf, contact_info,
+                                 hind_alignment)
+                << std::flush;
+      ++debug_print_count_;
+      debug_last_print_time_ = data->time;
+    }
+  } else if (debug_header_printed_ || debug_print_count_ > 0) {
+    debug_header_printed_ = false;
+    debug_print_count_ = 0;
+    debug_last_print_time_ = -std::numeric_limits<double>::infinity();
   }
 
+  if (hind_grf_align_sensor_id_ >= 0) {
+    residual[counter++] = hind_alignment[0];
+    residual[counter++] = hind_alignment[1];
+  }
 
   // sensor dim sanity check
   CheckSensorDim(model, counter);
 }
 
-bool QuadrupedFlat::ResidualFn::MotorVector(A1Foot foot,
-                                            const double contact_point[3],
-                                            const double contact_normal[3],
-                                            const mjData* data,
-                                            double motor_vector[3]) const {
-  if (!contact_point || !contact_normal) return false;
-  if (mju_norm3(contact_normal) < kContactForceThreshold) return false;
-  double best_alignment = -1.0;
-  bool found = false;
-  double contact_to_motor[3];
-  double normalized_motor[3];
-  for (int motor = 0; motor < kMotorsPerFoot; ++motor) {
-    int id = motor_body_id_[foot][motor];
-    if (id < 0) continue;
-    const double* motor_pos = data->xipos + 3 * id;
-    mju_sub3(contact_to_motor, motor_pos, contact_point);
-    double length = mju_norm3(contact_to_motor);
-    if (length <= 1.0e-9) continue;
-    mju_scl3(normalized_motor, contact_to_motor, 1.0 / length);
-    double alignment = mju_abs(mju_dot3(normalized_motor, contact_normal));
-    if (alignment > best_alignment) {
-      best_alignment = alignment;
-      mju_copy3(motor_vector, normalized_motor);
-      found = true;
-    }
-  }
-  return found;
-}
-
-bool QuadrupedFlat::ResidualFn::MotorPlaneNormal(A1Foot foot,
-                                                 const mjData* data,
-                                                 double plane_normal[3]) const {
-  if (!plane_normal) return false;
-  int body_id = motor_body_id_[foot][1];  // default to thigh
-  if (body_id < 0) {
-    body_id = motor_body_id_[foot][0];  // fallback hip
-  }
-  if (body_id < 0) {
-    body_id = motor_body_id_[foot][2];  // fallback calf
-  }
-  if (body_id < 0) return false;
-  const double* xmat = data->xmat + 9 * body_id;
-  plane_normal[0] = xmat[1];
-  plane_normal[1] = xmat[4];
-  plane_normal[2] = xmat[7];
-  double norm = mju_norm3(plane_normal);
-  if (norm < kContactForceThreshold) {
-    return false;
-  }
-  mju_scl3(plane_normal, plane_normal, 1.0 / norm);
-  return true;
-}
-
-void QuadrupedFlat::ResidualFn::UpdateGrfTarget(const mjModel* model,
-                                                const mjData* data,
-                                                const double* comvel,
-                                                const double* comacc) const {
-  if (total_mass_ <= 0) {
-    mju_zero3(grf_target_);
-    return;
-  }
-
-  double base_target[3];
-  mju_copy3(base_target, model->opt.gravity);
-  mju_scl3(base_target, base_target, -total_mass_);
-  mju_copy3(grf_target_, base_target);
-
-  double measured_accel[3] = {0, 0, 0};
-  bool have_measurement = false;
-
-  if (comacc != nullptr) {
-    mju_copy3(measured_accel, comacc);
-    have_measurement = true;
-  }
-
-  double dt = data->time - last_accel_time_;
-  bool reset_filter = (last_accel_time_ < 0.0) || (dt <= 0.0) ||
-                      (dt > kDesiredAccelMaxDt);
-
-  if (!have_measurement && comvel != nullptr) {
-    if (!reset_filter) {
-      mju_sub3(measured_accel, comvel, last_com_vel_);
-      if (dt > 1.0e-6) {
-        mju_scl3(measured_accel, measured_accel, 1.0 / dt);
-        have_measurement = true;
-      } else {
-        reset_filter = true;
-      }
-    }
-  }
-
-  if (!have_measurement) {
-    if (reset_filter) {
-      mju_zero3(filtered_desired_accel_);
-    }
-    if (comvel != nullptr) {
-      mju_copy3(last_com_vel_, comvel);
-    }
-    last_accel_time_ = data->time;
-    return;
-  }
-
-  for (int i = 0; i < 3; ++i) {
-    if (!std::isfinite(measured_accel[i])) {
-      measured_accel[i] = 0.0;
-    }
-    measured_accel[i] = mju_clip(measured_accel[i],
-                                 -kDesiredAccelLimit, kDesiredAccelLimit);
-  }
-
-  if (reset_filter) {
-    mju_copy3(filtered_desired_accel_, measured_accel);
-  } else {
-    double alpha = 1.0 - std::exp(-dt / kDesiredAccelFilterTimeConstant);
-    alpha = mju_min(1.0, mju_max(0.0, alpha));
-    for (int i = 0; i < 3; ++i) {
-      filtered_desired_accel_[i] +=
-          alpha * (measured_accel[i] - filtered_desired_accel_[i]);
-    }
-  }
-
-  mju_addToScl3(grf_target_, filtered_desired_accel_, total_mass_);
-
-  double gravity_norm = mju_norm3(model->opt.gravity);
-  double max_force_norm = total_mass_ * (gravity_norm + kDesiredAccelLimit);
-  double current_norm = mju_norm3(grf_target_);
-  if (max_force_norm > 0 && current_norm > max_force_norm) {
-    mju_scl3(grf_target_, grf_target_, max_force_norm / current_norm);
-  }
-
-  double horizontal_limit = total_mass_ * kDesiredAccelLimit;
-  grf_target_[0] = mju_clip(grf_target_[0], -horizontal_limit, horizontal_limit);
-  grf_target_[1] = mju_clip(grf_target_[1], -horizontal_limit, horizontal_limit);
-  double vertical_limit = total_mass_ * (gravity_norm + kDesiredAccelLimit);
-  grf_target_[2] = mju_clip(grf_target_[2], -vertical_limit, vertical_limit);
-
-  if (comvel != nullptr) {
-    mju_copy3(last_com_vel_, comvel);
-  }
-  last_accel_time_ = data->time;
-}
-
 //  ============  transition  ============
 void QuadrupedFlat::TransitionLocked(mjModel* model, mjData* data) {
-  // Ensure parameter/body ids are initialized (defensive against early calls)
-  if (residual_.cadence_param_id_ < 0 ||
-      residual_.gait_param_id_ < 0 ||
-      residual_.gait_switch_param_id_ < 0 ||
-      residual_.torso_body_id_ < 0 ||
-      residual_.head_site_id_ < 0 ||
-      residual_.goal_mocap_id_ < 0) {
-    ResetLocked(model);
-  }
   // ---------- handle mjData reset ----------
   if (data->time < residual_.last_transition_time_ ||
       residual_.last_transition_time_ == -1) {
     if (mode != ResidualFn::kModeQuadruped && mode != ResidualFn::kModeBiped) {
       mode = ResidualFn::kModeQuadruped;  // mode stateful, switch to Quadruped
     }
-    if (residual_.gait_switch_param_id_ >= 0 &&
-        residual_.gait_switch_param_id_ < static_cast<int>(parameters.size())) {
-      int current_switch =
-          ReinterpretAsInt(parameters[residual_.gait_switch_param_id_]);
-      if (current_switch == 0) {
-        parameters[residual_.gait_switch_param_id_] = ReinterpretAsDouble(1);
-      }
-    }
     residual_.last_transition_time_ = residual_.phase_start_time_ =
         residual_.phase_start_ = data->time;
-    // initialize current_gait_ from the parameter on first reset
-    if (residual_.gait_param_id_ >= 0 &&
-        residual_.gait_param_id_ < static_cast<int>(parameters.size())) {
-      residual_.current_gait_ = parameters[residual_.gait_param_id_];
-    } else {
-      residual_.current_gait_ = ResidualFn::kGaitStand;
-    }
   }
 
   // ---------- prevent forbidden mode transitions ----------
@@ -993,11 +570,7 @@ void QuadrupedFlat::TransitionLocked(mjModel* model, mjData* data) {
   }
 
   // ---------- handle phase velocity change ----------
-  double phase_velocity = residual_.phase_velocity_;
-  if (residual_.cadence_param_id_ >= 0 &&
-      residual_.cadence_param_id_ < static_cast<int>(parameters.size())) {
-    phase_velocity = 2 * mjPI * parameters[residual_.cadence_param_id_];
-  }
+  double phase_velocity = 2 * mjPI * parameters[residual_.cadence_param_id_];
   if (phase_velocity != residual_.phase_velocity_) {
     residual_.phase_start_ = residual_.GetPhase(data->time);
     residual_.phase_start_time_ = data->time;
@@ -1012,18 +585,12 @@ void QuadrupedFlat::TransitionLocked(mjModel* model, mjData* data) {
   residual_.com_vel_[0] = beta * residual_.com_vel_[0] + (1 - beta) * comvel[0];
   residual_.com_vel_[1] = beta * residual_.com_vel_[1] + (1 - beta) * comvel[1];
   // TODO(b/268398978): remove reinterpret, int64_t business
-  int auto_switch = 0;
-  if (residual_.gait_switch_param_id_ >= 0 &&
-      residual_.gait_switch_param_id_ < static_cast<int>(parameters.size())) {
-    auto_switch = ReinterpretAsInt(parameters[residual_.gait_switch_param_id_]);
-  }
+  int auto_switch =
+      ReinterpretAsInt(parameters[residual_.gait_switch_param_id_]);
   if (mode == ResidualFn::kModeBiped) {
     // biped always trots
-    if (residual_.gait_param_id_ >= 0 &&
-        residual_.gait_param_id_ < static_cast<int>(parameters.size())) {
-      parameters[residual_.gait_param_id_] =
-          ReinterpretAsDouble(ResidualFn::kGaitTrot);
-    }
+    parameters[residual_.gait_param_id_] =
+        ReinterpretAsDouble(ResidualFn::kGaitTrot);
   } else if (auto_switch) {
     double com_speed = mju_norm(residual_.com_vel_, 2);
     for (int64_t gait : ResidualFn::kGaitAll) {
@@ -1036,10 +603,7 @@ void QuadrupedFlat::TransitionLocked(mjModel* model, mjData* data) {
       bool wait = mju_abs(residual_.gait_switch_time_ - data->time) >
                   ResidualFn::kAutoGaitMinTime;
       if (lower && upper && wait) {
-        if (residual_.gait_param_id_ >= 0 &&
-            residual_.gait_param_id_ < static_cast<int>(parameters.size())) {
-          parameters[residual_.gait_param_id_] = ReinterpretAsDouble(gait);
-        }
+        parameters[residual_.gait_param_id_] = ReinterpretAsDouble(gait);
         residual_.gait_switch_time_ = data->time;
       }
     }
@@ -1047,50 +611,27 @@ void QuadrupedFlat::TransitionLocked(mjModel* model, mjData* data) {
 
 
   // ---------- handle gait switch, manual or auto ----------
-  double gait_selection = residual_.current_gait_;
-  if (residual_.gait_param_id_ >= 0 &&
-      residual_.gait_param_id_ < static_cast<int>(parameters.size())) {
-    gait_selection = parameters[residual_.gait_param_id_];
-  }
+  double gait_selection = parameters[residual_.gait_param_id_];
   if (gait_selection != residual_.current_gait_) {
     residual_.current_gait_ = gait_selection;
     ResidualFn::A1Gait gait = residual_.GetGait();
-    auto set_param = [&](int idx, double val) {
-      if (idx >= 0 && idx < static_cast<int>(parameters.size())) {
-        parameters[idx] = val;
-      }
-    };
-    auto set_weight = [&](int idx, double val) {
-      if (idx >= 0 && idx < static_cast<int>(weight.size())) {
-        weight[idx] = val;
-      }
-    };
-    set_param(residual_.duty_param_id_, ResidualFn::kGaitParam[gait][0]);
-    set_param(residual_.cadence_param_id_, ResidualFn::kGaitParam[gait][1]);
-    set_param(residual_.amplitude_param_id_, ResidualFn::kGaitParam[gait][2]);
-    set_weight(residual_.balance_cost_id_, ResidualFn::kGaitParam[gait][3]);
-    set_weight(residual_.upright_cost_id_, ResidualFn::kGaitParam[gait][4]);
-    set_weight(residual_.height_cost_id_, ResidualFn::kGaitParam[gait][5]);
+    parameters[residual_.duty_param_id_] = ResidualFn::kGaitParam[gait][0];
+    parameters[residual_.cadence_param_id_] = ResidualFn::kGaitParam[gait][1];
+    parameters[residual_.amplitude_param_id_] = ResidualFn::kGaitParam[gait][2];
+    weight[residual_.balance_cost_id_] = ResidualFn::kGaitParam[gait][3];
+    weight[residual_.upright_cost_id_] = ResidualFn::kGaitParam[gait][4];
+    weight[residual_.height_cost_id_] = ResidualFn::kGaitParam[gait][5];
   }
 
 
   // ---------- Walk ----------
-  if (residual_.goal_mocap_id_ < 0 ||
-      3 * residual_.goal_mocap_id_ + 2 >= model->nmocap * 3) {
-    return;  // invalid goal mocap index
-  }
   double* goal_pos = data->mocap_pos + 3*residual_.goal_mocap_id_;
   if (mode == ResidualFn::kModeWalk) {
-  int turn_idx = ParameterIndex(model, "Walk turn");
-  int speed_idx = ParameterIndex(model, "Walk speed");
-  double angvel = (turn_idx >= 0 && turn_idx < static_cast<int>(parameters.size())) ?
-          parameters[turn_idx] : 0;
-  double speed = (speed_idx >= 0 && speed_idx < static_cast<int>(parameters.size())) ?
-           parameters[speed_idx] : 0;
+    double angvel = parameters[ParameterIndex(model, "Walk turn")];
+    double speed = parameters[ParameterIndex(model, "Walk speed")];
 
     // current torso direction
-  if (residual_.torso_body_id_ < 0) return;
-  double* torso_xmat = data->xmat + 9*residual_.torso_body_id_;
+    double* torso_xmat = data->xmat + 9*residual_.torso_body_id_;
     double forward[2] = {torso_xmat[0], torso_xmat[3]};
     mju_normalize(forward, 2);
     double leftward[2] = {-forward[1], forward[0]};
@@ -1130,7 +671,6 @@ void QuadrupedFlat::TransitionLocked(mjModel* model, mjData* data) {
 
   // ---------- Flip ----------
   double* compos = SensorByName(model, data, "torso_subtreecom");
-  if (!compos) return;
   if (mode == ResidualFn::kModeFlip) {
     // switching into Flip, reset task state
     if (mode != residual_.current_mode_) {
@@ -1147,21 +687,14 @@ void QuadrupedFlat::TransitionLocked(mjModel* model, mjData* data) {
       residual_.save_gait_switch_ = parameters[residual_.gait_switch_param_id_];
 
       // set parameters
-      auto set_w = [&](const char* name, double val){
-        int idx = CostTermByName(model, name);
-        if (idx >= 0 && idx < static_cast<int>(weight.size())) weight[idx] = val;
-      };
-      set_w("Upright", 0.2);
-      set_w("Height", 5);
-      set_w("Position", 0);
-      set_w("Gait", 0);
-      set_w("Balance", 0);
-      set_w("Effort", 0.005);
-      set_w("Posture", 0.1);
-      if (residual_.gait_switch_param_id_ >= 0 &&
-          residual_.gait_switch_param_id_ < static_cast<int>(parameters.size())) {
-        parameters[residual_.gait_switch_param_id_] = ReinterpretAsDouble(0);
-      }
+      weight[CostTermByName(model, "Upright")] = 0.2;
+      weight[CostTermByName(model, "Height")] = 5;
+      weight[CostTermByName(model, "Position")] = 0;
+      weight[CostTermByName(model, "Gait")] = 0;
+      weight[CostTermByName(model, "Balance")] = 0;
+      weight[CostTermByName(model, "Effort")] = 0.005;
+      weight[CostTermByName(model, "Posture")] = 0.1;
+      parameters[residual_.gait_switch_param_id_] = ReinterpretAsDouble(1);
     }
 
     // time from start of Flip
@@ -1181,7 +714,6 @@ void QuadrupedFlat::TransitionLocked(mjModel* model, mjData* data) {
   // save mode
   residual_.current_mode_ = static_cast<ResidualFn::A1Mode>(mode);
   residual_.last_transition_time_ = data->time;
-
 }
 
 // colors of visualisation elements drawn in ModifyScene()
@@ -1317,12 +849,9 @@ void QuadrupedFlat::ResetLocked(const mjModel* model) {
   residual_.amplitude_param_id_ = ParameterIndex(model, "Amplitude");
   residual_.duty_param_id_ = ParameterIndex(model, "Duty ratio");
   residual_.arm_posture_param_id_ = ParameterIndex(model, "Arm posture");
-  residual_.debug_log_param_id_ = ParameterIndex(model, "Debug GRF log");
   residual_.balance_cost_id_ = CostTermByName(model, "Balance");
   residual_.upright_cost_id_ = CostTermByName(model, "Upright");
   residual_.height_cost_id_ = CostTermByName(model, "Height");
-  residual_.grf_cost_id_ = CostTermByName(model, "GRF");
-  residual_.hind_grf_cost_id_ = CostTermByName(model, "Hind GRF Align");
 
   // ----------  model identifiers  ----------
   residual_.torso_body_id_ = mj_name2id(model, mjOBJ_XBODY, "trunk");
@@ -1355,52 +884,39 @@ void QuadrupedFlat::ResetLocked(const mjModel* model) {
     shoulder_index++;
   }
 
-  // motor body ids by foot
+  residual_.debug_grf_param_id_ = ParameterIndex(model, "Debug GRF log");
+  residual_.hind_grf_align_sensor_id_ =
+      mj_name2id(model, mjOBJ_SENSOR, "Hind GRF Align");
+  residual_.debug_header_printed_ = false;
+  residual_.debug_print_count_ = 0;
+  residual_.debug_last_print_time_ = -std::numeric_limits<double>::infinity();
+
   for (int foot = 0; foot < ResidualFn::kNumFoot; ++foot) {
-    for (int motor = 0; motor < ResidualFn::kMotorsPerFoot; ++motor) {
-      const char* primary = ResidualFn::kMotorBodyNames[foot][motor];
-      int body_id = -1;
-      if (primary) {
-        body_id = mj_name2id(model, mjOBJ_BODY, primary);
-      }
-      if (body_id < 0) {
-        const char* fallback = ResidualFn::kMotorBodyFallback[foot][motor];
-        if (fallback) {
-          body_id = mj_name2id(model, mjOBJ_BODY, fallback);
-        }
-      }
-      if (body_id < 0) {
-        if (primary) {
-          mju_error_s("body '%s' not found", primary);
-        } else {
-          mju_error("motor body name missing");
-        }
-      }
-      residual_.motor_body_id_[foot][motor] = body_id;
+    const char* abduction_joint =
+        ResidualFn::kAbductionJointNames[foot];
+    residual_.abduction_joint_id_[foot] =
+        mj_name2id(model, mjOBJ_JOINT, abduction_joint);
+    if (residual_.abduction_joint_id_[foot] < 0) {
+      mju_error_s("joint '%s' not found", abduction_joint);
+    }
+    const char* hip_joint = ResidualFn::kHipJointNames[foot];
+    residual_.hip_joint_id_[foot] =
+        mj_name2id(model, mjOBJ_JOINT, hip_joint);
+    if (residual_.hip_joint_id_[foot] < 0) {
+      mju_error_s("joint '%s' not found", hip_joint);
+    }
+    const char* knee_joint = ResidualFn::kKneeJointNames[foot];
+    residual_.knee_joint_id_[foot] =
+        mj_name2id(model, mjOBJ_JOINT, knee_joint);
+    if (residual_.knee_joint_id_[foot] < 0) {
+      mju_error_s("joint '%s' not found", knee_joint);
     }
   }
 
-  // compute total mass (robot subtree only) and GRF target
-  residual_.total_mass_ = 0;
-  if (residual_.torso_body_id_ >= 0 &&
-      residual_.torso_body_id_ < model->nbody) {
-    int root_id = model->body_rootid[residual_.torso_body_id_];
-    for (int i = 0; i < model->nbody; ++i) {
-      if (model->body_rootid[i] == root_id) {
-        residual_.total_mass_ += model->body_mass[i];
-      }
-    }
+  residual_.total_mass_ = 0.0;
+  for (int i = 0; i < model->nbody; ++i) {
+    residual_.total_mass_ += model->body_mass[i];
   }
-  mju_zero3(residual_.grf_target_);
-  if (residual_.total_mass_ > 0) {
-    for (int i = 0; i < 3; ++i) {
-      residual_.grf_target_[i] = -residual_.total_mass_ * model->opt.gravity[i];
-    }
-  }
-  mju_zero3(residual_.filtered_desired_accel_);
-  mju_zero3(residual_.last_com_vel_);
-  residual_.last_accel_time_ = -1.0;
-  residual_.last_debug_print_time_ = -1.0;
 
   // ----------  derived kinematic quantities for Flip  ----------
   residual_.gravity_ = mju_norm3(model->opt.gravity);
@@ -1492,22 +1008,7 @@ void QuadrupedFlat::ResidualFn::Walk(double pos[2], double time) const {
 QuadrupedFlat::ResidualFn::A1Gait QuadrupedFlat::ResidualFn::GetGait() const {
   if (current_mode_ == kModeBiped)
     return kGaitTrot;
-  int gi = ReinterpretAsInt(current_gait_);
-  // Fallback: if reinterpret produced invalid value, try numeric cast
-  if (gi < 0 || gi >= kNumGait) {
-    // try to round the double value into an int index within [0, kNumGait)
-    int rounded = static_cast<int>(current_gait_ >= 0 ? current_gait_ + 0.5
-                                                      : current_gait_ - 0.5);
-    if (rounded >= 0 && rounded < kNumGait) {
-      gi = rounded;
-    } else {
-      gi = kGaitStand;
-    }
-  }
-  // Clamp to valid range
-  if (gi < 0) gi = 0;
-  if (gi >= kNumGait) gi = kNumGait - 1;
-  return static_cast<A1Gait>(gi);
+  return static_cast<A1Gait>(ReinterpretAsInt(current_gait_));
 }
 
 // return normalized target step height
@@ -1527,13 +1028,8 @@ void QuadrupedFlat::ResidualFn::FootStep(double step[kNumFoot], double time,
                                          A1Gait gait) const {
   double amplitude = parameters_[amplitude_param_id_];
   double duty_ratio = parameters_[duty_param_id_];
-  // guard against invalid gait
-  int gi = static_cast<int>(gait);
-  if (gi < 0 || gi >= kNumGait) {
-    gi = kGaitStand;
-  }
   for (A1Foot foot : kFootAll) {
-    double footphase = 2*mjPI*kGaitPhase[gi][foot];
+    double footphase = 2*mjPI*kGaitPhase[gait][foot];
     step[foot] = amplitude * StepHeight(time, footphase, duty_ratio);
   }
 }

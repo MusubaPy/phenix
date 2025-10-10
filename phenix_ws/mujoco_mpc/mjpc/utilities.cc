@@ -232,6 +232,17 @@ int ParameterIndex(const mjModel* model, std::string_view name) {
 double DefaultResidualSelection(const mjModel* m, int numeric_index) {
   // list selections are stored as ints, but numeric values are doubles.
   double stored = m->numeric_data[m->numeric_adr[numeric_index]];
+
+  // Historically selection defaults were stored by reinterpreting integer
+  // bits as doubles (via ReinterpretAsDouble).  Editing XML by hand is much
+  // easier if the author can simply write the desired integer (0, 1, ...)
+  // instead of the denormalised IEEE-754 representations.  Support both by
+  // detecting "plain" numeric values and converting them to the encoded form.
+  if (std::abs(stored) >= 0.5) {
+    // Treat the author-provided number as the intended selection index.
+    return ReinterpretAsDouble(static_cast<int64_t>(std::llround(stored)));
+  }
+
   int64_t bits = 0;
   static_assert(sizeof(bits) == sizeof(stored),
                 "Expected numeric storage to be 64-bit");

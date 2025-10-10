@@ -1038,8 +1038,13 @@ void Agent::Plots(const mjData* data, int shift) {
   plots_.cost.range[1][0] = cost_bounds[0];
   plots_.cost.range[1][1] = cost_bounds[1];
 
+
   // legend
   mju::strcpy_arr(plots_.cost.linename[0], "Total Cost");
+
+  // Индексы cost-термов GRF (и Hind GRF Align)
+  int grf_idx = CostTermByName(model_, "GRF");
+  int hind_grf_idx = CostTermByName(model_, "Hind GRF Align");
 
   // plot costs
   for (int k = 0; k < ActiveTask()->num_term; k++) {
@@ -1049,8 +1054,14 @@ void Agent::Plots(const mjData* data, int shift) {
                      4 + k, 1, 1, time_lower_bound);
     }
     // legend
-    mju::strcpy_arr(plots_.cost.linename[4 + ActiveTask()->num_term + k],
-                    model_->names + model_->name_sensoradr[k]);
+    if (k == grf_idx) {
+      mju::strcpy_arr(plots_.cost.linename[4 + ActiveTask()->num_term + k], "GRF Cost");
+    } else if (k == hind_grf_idx) {
+      mju::strcpy_arr(plots_.cost.linename[4 + ActiveTask()->num_term + k], "Hind GRF Align");
+    } else {
+      mju::strcpy_arr(plots_.cost.linename[4 + ActiveTask()->num_term + k],
+                      model_->names + model_->name_sensoradr[k]);
+    }
   }
 
   // predicted residual

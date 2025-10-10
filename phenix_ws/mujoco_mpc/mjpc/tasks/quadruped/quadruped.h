@@ -15,8 +15,10 @@
 #ifndef MJPC_TASKS_QUADRUPED_QUADRUPED_H_
 #define MJPC_TASKS_QUADRUPED_QUADRUPED_H_
 
+#include <limits>
 #include <string>
 #include <vector>
+
 #include <mujoco/mujoco.h>
 #include "mjpc/task.h"
 
@@ -29,21 +31,7 @@ class QuadrupedFlat : public Task {
   class ResidualFn : public mjpc::BaseResidualFn {
    public:
     explicit ResidualFn(const QuadrupedFlat* task)
-        : mjpc::BaseResidualFn(task) {
-      mju_zero3(grf_target_);
-      mju_zero3(filtered_desired_accel_);
-      mju_zero3(last_com_vel_);
-      last_accel_time_ = -1.0;
-      for (int foot = 0; foot < kNumFoot; ++foot) {
-        for (int motor = 0; motor < kMotorsPerFoot; ++motor) {
-          motor_body_id_[foot][motor] = -1;
-        }
-        mju_zero3(filtered_foot_force_[foot]);
-        mju_zero3(filtered_contact_normal_[foot]);
-      }
-      last_grf_update_time_ = -1.0;
-      last_debug_print_time_ = -1.0;
-    }
+        : mjpc::BaseResidualFn(task) {}
     ResidualFn(const ResidualFn&) = default;
     void Residual(const mjModel* model, const mjData* data,
                   double* residual) const override;
@@ -84,42 +72,16 @@ class QuadrupedFlat : public Task {
     constexpr static A1Foot kFootAll[kNumFoot] = {kFootFL, kFootHL,
                                                   kFootFR, kFootHR};
     constexpr static A1Foot kFootHind[2] = {kFootHL, kFootHR};
-    constexpr static A1Foot kFootFront[2] = {kFootFL, kFootFR};
-  static constexpr const char* const kFootNames[kNumFoot] = {
-    "FL", "HL", "FR", "HR"};
-    constexpr static int kMotorsPerFoot = 3;
-  constexpr static double kContactForceThreshold = 1.0e-6;
-  constexpr static double kDesiredAccelFilterTimeConstant = 0.05;  // second
-  constexpr static double kDesiredAccelMaxDt = 0.2;                // second
-  constexpr static double kDesiredAccelLimit = 30.0;               // m/s^2
-  constexpr static double kGrfFilterTimeConstant = 0.01;           // second
-  constexpr static double kSupportForceActivation = 5.0;           // newton
-  constexpr static double kPlanarSpeedLow = 0.15;                  // m/s
-  constexpr static double kPlanarSpeedHigh = 1.2;                  // m/s
-  constexpr static double kPlanarSpeedFloor = 0.35;                // unitless
-  constexpr static double kDynamicGaitPlanarScale = 0.45;          // unitless
-  constexpr static double kNetForceMinScale = 0.15;                // unitless
-  constexpr static double kHindAlignmentMinScale = 0.25;           // unitless
-  constexpr static double kDebugLogInterval = 0.05;                // second
-  constexpr static double kSupportResidualMinFraction = 0.1;       // unitless
-  constexpr static double kGrfWeightSoftReference = 5.0e-1;        // unitless
-    static constexpr const char* const kMotorBodyNames[kNumFoot]
-        [kMotorsPerFoot] = {
-            {"FL_hip", "FL_thigh", "FL_calf"},
-            {"HL_hip", "RL_thigh", "RL_calf"},
-            {"FR_hip", "FR_thigh", "FR_calf"},
-            {"HR_hip", "RR_thigh", "RR_calf"},
-        };
-    static constexpr const char* const kMotorBodyFallback[kNumFoot]
-        [kMotorsPerFoot] = {
-            {nullptr, nullptr, nullptr},
-            {"RL_hip", "HL_thigh", "HL_calf"},
-            {nullptr, nullptr, nullptr},
-            {"RR_hip", "HR_thigh", "HR_calf"},
-        };
     constexpr static A1Gait kGaitAll[kNumGait] = {kGaitStand, kGaitWalk,
                                                   kGaitTrot, kGaitCanter,
                                                   kGaitGallop};
+    constexpr static const char* kAbductionJointNames[kNumFoot] = {
+        "FL_hip_joint", "RL_hip_joint", "FR_hip_joint", "RR_hip_joint"};
+    constexpr static const char* kHipJointNames[kNumFoot] = {
+        "FL_thigh_joint", "RL_thigh_joint", "FR_thigh_joint",
+        "RR_thigh_joint"};
+    constexpr static const char* kKneeJointNames[kNumFoot] = {
+        "FL_calf_joint", "RL_calf_joint", "FR_calf_joint", "RR_calf_joint"};
 
     // gait phase signature (normalized)
     constexpr static double kGaitPhase[kNumGait][kNumFoot] =
@@ -204,19 +166,6 @@ class QuadrupedFlat : public Task {
     // compute target step height for all feet
     void FootStep(double step[kNumFoot], double time, A1Gait gait) const;
 
-    // compute vector from contact point towards best-aligned motor
-    bool MotorVector(A1Foot foot, const double contact_point[3],
-                     const double contact_normal[3], const mjData* data,
-                     double motor_vector[3]) const;
-
-  // return normal vector to the motor workspace plane for a given foot
-  bool MotorPlaneNormal(A1Foot foot, const mjData* data,
-              double plane_normal[3]) const;
-
-  // update GRF target based on filtered desired CoM acceleration
-  void UpdateGrfTarget(const mjModel* model, const mjData* data,
-             const double* comvel, const double* comacc) const;
-
     // walk horizontal position given time
     void Walk(double pos[2], double time) const;
 
@@ -268,12 +217,13 @@ class QuadrupedFlat : public Task {
     int upright_cost_id_      = -1;
     int balance_cost_id_      = -1;
     int height_cost_id_       = -1;
-    int grf_cost_id_          = -1;
-    int hind_grf_cost_id_     = -1;
-  int debug_log_param_id_   = -1;
     int foot_geom_id_[kNumFoot];
     int shoulder_body_id_[kNumFoot];
-    int motor_body_id_[kNumFoot][kMotorsPerFoot];
+    int abduction_joint_id_[kNumFoot] = {-1, -1, -1, -1};
+    int hip_joint_id_[kNumFoot] = {-1, -1, -1, -1};
+    int knee_joint_id_[kNumFoot] = {-1, -1, -1, -1};
+    int debug_grf_param_id_   = -1;
+    int hind_grf_align_sensor_id_ = -1;
 
     // derived kinematic quantities describing flip trajectory
     double gravity_           = 0;
@@ -290,18 +240,12 @@ class QuadrupedFlat : public Task {
     double jump_rot_vel_      = 0;
     double jump_rot_acc_      = 0;
     double land_rot_acc_      = 0;
+    double total_mass_        = 0;
 
-    // ground reaction force bookkeeping
-    double total_mass_         = 0;
-    mutable double grf_target_[3];
-    mutable double filtered_desired_accel_[3];
-    mutable double last_com_vel_[3];
-    mutable double last_accel_time_ = -1.0;
-    mutable double filtered_foot_force_[kNumFoot][3];
-    mutable double filtered_contact_normal_[kNumFoot][3];
-    mutable double last_grf_update_time_ = -1.0;
-    mutable double last_debug_print_time_ = -1.0;
-
+    // debug logging state
+    mutable bool debug_header_printed_ = false;
+    mutable int debug_print_count_ = 0;
+    mutable double debug_last_print_time_ = -std::numeric_limits<double>::infinity();
   };
 
   QuadrupedFlat() : residual_(this) {}
