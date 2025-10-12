@@ -32,7 +32,7 @@ namespace {
 constexpr double kForceThreshold = 1e-6;
 constexpr double kPlaneProjectionEps = 1e-8;
 constexpr int kDebugWidth = 10;
-constexpr double kDebugPrintInterval = 0.5;   // seconds between debug rows
+constexpr double kDebugPrintInterval = 0.1;   // seconds between debug rows
 constexpr int kDebugHeaderRepeat = 20;        // reprint header every N rows
 
 struct FootContactInfo {
@@ -52,14 +52,15 @@ std::mutex& DebugMutex() {
 
 std::string BuildDebugHeader() {
   std::ostringstream oss;
-  std::vector<std::string> headers = {"time", "net_x", "net_y", "net_z"};
-  for (const char* label : kFootLabels) {
-    headers.push_back(std::string(label) + "_fx");
-    headers.push_back(std::string(label) + "_fy");
-    headers.push_back(std::string(label) + "_fz");
-  }
-  headers.push_back("align_HL");
-  headers.push_back("align_HR");
+  std::vector<std::string> headers = {
+    "time",
+    "net_force[x y z]",
+    "FL_force[x y z]",
+    "HL_force[x y z]",
+    "FR_force[x y z]",
+    "HR_force[x y z]",
+    "align[HL HR]"
+  };
 
   auto print_separator = [&]() {
     oss << '+';
@@ -80,25 +81,37 @@ std::string BuildDebugHeader() {
 }
 
 std::string BuildDebugRow(double time, const double net_force[3],
-                          const FootContactInfo* contact_info,
-                          const double hind_alignment[2]) {
+              const FootContactInfo* contact_info,
+              const double hind_alignment[2]) {
   std::ostringstream oss;
   oss << '|'
-      << std::setw(kDebugWidth) << std::right << std::fixed
-      << std::setprecision(3) << time << '|'
-      << std::setw(kDebugWidth) << net_force[0] << '|'
-      << std::setw(kDebugWidth) << net_force[1] << '|'
-      << std::setw(kDebugWidth) << net_force[2] << '|';
+    << std::setw(kDebugWidth) << std::right << std::fixed
+    << std::setprecision(3) << time << '|';
 
+  // net_force as vector
+  oss << '['
+    << std::setw(kDebugWidth-3) << net_force[0] << ' '
+    << std::setw(kDebugWidth-3) << net_force[1] << ' '
+    << std::setw(kDebugWidth-3) << net_force[2] << ']'
+    << '|';
+
+  // Each foot force as vector
   for (size_t idx = 0; idx < 4; ++idx) {
-    const FootContactInfo& info = contact_info[idx];
-    oss << std::setw(kDebugWidth) << info.force[0] << '|'
-        << std::setw(kDebugWidth) << info.force[1] << '|'
-        << std::setw(kDebugWidth) << info.force[2] << '|';
+  const FootContactInfo& info = contact_info[idx];
+  oss << '['
+    << std::setw(kDebugWidth-3) << info.force[0] << ' '
+    << std::setw(kDebugWidth-3) << info.force[1] << ' '
+    << std::setw(kDebugWidth-3) << info.force[2] << ']'
+    << '|';
   }
-  oss << std::setw(kDebugWidth) << hind_alignment[0] << '|'
-      << std::setw(kDebugWidth) << hind_alignment[1] << '|'
-      << '\n';
+
+  // Hind alignment as vector
+  oss << '['
+    << std::setw(kDebugWidth-3) << hind_alignment[0] << ' '
+    << std::setw(kDebugWidth-3) << hind_alignment[1] << ']'
+    << '|';
+
+  oss << '\n';
   return oss.str();
 }
 
@@ -515,8 +528,10 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
   if (debug_enabled) {
     bool time_reset = data->time < debug_last_print_time_;
     double time_since_last = data->time - debug_last_print_time_;
-    bool should_print = time_reset || !debug_header_printed_ ||
-                        time_since_last >= kDebugPrintInterval;
+    // Only print if time has advanced by at least kDebugPrintInterval or time reset
+    bool should_print = time_reset || (!debug_header_printed_) ||
+                        (time_since_last >= kDebugPrintInterval &&
+                         data->time - std::floor(data->time / kDebugPrintInterval) * kDebugPrintInterval < 1e-6);
 
     if (should_print) {
       std::lock_guard<std::mutex> lock(DebugMutex());
