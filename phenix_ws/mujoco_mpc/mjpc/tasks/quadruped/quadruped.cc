@@ -34,6 +34,9 @@ constexpr double kPlaneProjectionEps = 1e-8;
 constexpr int kDebugWidth = 10;
 constexpr double kDebugPrintInterval = 0.1;   // seconds between debug rows
 constexpr int kDebugHeaderRepeat = 20;        // reprint header every N rows
+constexpr double kDebugTimeEpsilon = 1e-6;    // tolerance for time comparisons
+constexpr double kDebugResetThreshold =
+  4 * kDebugPrintInterval;  // difference treated as a real reset
 
 struct FootContactInfo {
   double force[3] = {0.0, 0.0, 0.0};
@@ -61,19 +64,21 @@ std::string BuildDebugHeader() {
     "HR_force[x y z]",
     "align[HL HR]"
   };
+  // Индивидуальные ширины столбцов (можно подправить под нужный формат)
+  std::vector<int> col_widths = {10, 25, 25, 25, 25, 25, 17};
 
   auto print_separator = [&]() {
     oss << '+';
     for (size_t i = 0; i < headers.size(); ++i) {
-      oss << std::string(kDebugWidth, '-') << '+';
+      oss << std::string(col_widths[i], '-') << '+';
     }
     oss << '\n';
   };
 
   print_separator();
   oss << '|';
-  for (const std::string& header : headers) {
-    oss << std::setw(kDebugWidth) << std::left << header << '|';
+  for (size_t i = 0; i < headers.size(); ++i) {
+    oss << std::setw(col_widths[i]) << std::left << headers[i] << '|';
   }
   oss << '\n';
   print_separator();
@@ -447,6 +452,7 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
     A1Foot foot = kFootHind[hind_idx];
     FootContactInfo& info = contact_info[foot];
     if (!info.in_contact) {
+      // Only the hind-left foot contributes to the alignment cost.
       hind_alignment[hind_idx] = 0.0;
       continue;
     }
@@ -459,23 +465,31 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
       continue;
     }
 
-    const mjtNum* abduction_anchor_ptr =
-        data->xanchor + 3 * model->jnt_dofadr[abduction_joint];
-    const mjtNum* hip_anchor_ptr =
-        data->xanchor + 3 * model->jnt_dofadr[hip_joint];
-    const mjtNum* knee_anchor_ptr =
-        data->xanchor + 3 * model->jnt_dofadr[knee_joint];
+  // `xanchor` is stored per joint (njnt), so index by joint id directly.
+  const mjtNum* abduction_anchor_ptr =
+    data->xanchor + 3 * abduction_joint;
+  const mjtNum* hip_anchor_ptr =
+    data->xanchor + 3 * hip_joint;
+  const mjtNum* knee_anchor_ptr =
+    data->xanchor + 3 * knee_joint;
     double anchors[3][3];
     mju_copy3(anchors[0], abduction_anchor_ptr);
     mju_copy3(anchors[1], hip_anchor_ptr);
     mju_copy3(anchors[2], knee_anchor_ptr);
 
-    double v1[3];
-    double v2[3];
-    mju_sub3(v1, anchors[1], anchors[0]);
-    mju_sub3(v2, anchors[2], anchors[0]);
+    double foot_point[3];
+    if (info.in_contact) {
+      mju_copy3(foot_point, info.point);
+    } else {
+      mju_copy3(foot_point, foot_pos[foot]);
+    }
+
+    double plane_vec1[3];  // hip -> knee
+    double plane_vec2[3];  // knee -> foot contact
+    mju_sub3(plane_vec1, anchors[1], anchors[2]);
+    mju_sub3(plane_vec2, foot_point, anchors[2]);
     double plane_normal[3];
-    mju_cross(plane_normal, v1, v2);
+    mju_cross(plane_normal, plane_vec1, plane_vec2);
     if (mju_norm3(plane_normal) < kPlaneProjectionEps) {
       hind_alignment[hind_idx] = 0.0;
       continue;
@@ -494,11 +508,12 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
 
     double best_motor_proj[3] = {0.0, 0.0, 0.0};
     double smallest_angle = mjMAXVAL;
-    for (int motor = 0; motor < 3; ++motor) {
-      double motor_vec[3];
-      mju_sub3(motor_vec, anchors[motor], info.point);
+    double candidate_vectors[2][3];
+    mju_sub3(candidate_vectors[0], anchors[2], anchors[1]);       // hip -> knee
+    mju_sub3(candidate_vectors[1], foot_point, anchors[2]);       // knee -> foot
+    for (int candidate = 0; candidate < 2; ++candidate) {
       double motor_proj[3];
-      ProjectOntoPlane(motor_proj, motor_vec, plane_normal);
+      ProjectOntoPlane(motor_proj, candidate_vectors[candidate], plane_normal);
       if (mju_norm3(motor_proj) < kPlaneProjectionEps) {
         continue;
       }
@@ -513,8 +528,8 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
       continue;
     }
 
-    double grf_proj[3];
-    ProjectOntoPlane(grf_proj, info.force, plane_normal);
+  double grf_proj[3];
+  ProjectOntoPlane(grf_proj, info.force, plane_normal);
     if (mju_norm3(grf_proj) < kPlaneProjectionEps) {
       hind_alignment[hind_idx] = 0.0;
       continue;
@@ -526,31 +541,62 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
   bool debug_enabled =
       debug_grf_param_id_ >= 0 && parameters_[debug_grf_param_id_] > 0.5;
   if (debug_enabled) {
-    bool time_reset = data->time < debug_last_print_time_;
-    double time_since_last = data->time - debug_last_print_time_;
-    // Only print if time has advanced by at least kDebugPrintInterval or time reset
-    bool should_print = time_reset || (!debug_header_printed_) ||
-                        (time_since_last >= kDebugPrintInterval &&
-                         data->time - std::floor(data->time / kDebugPrintInterval) * kDebugPrintInterval < 1e-6);
+    double current_time = data->time;
+    bool should_print = false;
+    bool print_header = false;
+
+    auto state = debug_log_state_;
+    {
+      std::lock_guard<std::mutex> state_lock(state->state_mutex);
+
+      if (!std::isfinite(state->next_print_time)) {
+        state->next_print_time = current_time;
+      }
+
+      double time_delta = state->last_print_time - current_time;
+      bool out_of_order_sample = false;
+
+      if (time_delta > kDebugTimeEpsilon) {
+        if (time_delta > kDebugResetThreshold) {
+          state->header_printed = false;
+          state->print_count = 0;
+          state->next_print_time = current_time;
+          state->last_print_time = current_time;
+        } else {
+          out_of_order_sample = true;
+        }
+      } else {
+        state->last_print_time = current_time;
+      }
+
+      if (!out_of_order_sample &&
+          current_time + kDebugTimeEpsilon >= state->next_print_time) {
+        should_print = true;
+        print_header = !state->header_printed ||
+                       (state->print_count % kDebugHeaderRepeat) == 0;
+        state->header_printed = true;
+        state->print_count++;
+        state->last_print_time = current_time;
+        state->next_print_time = current_time + kDebugPrintInterval;
+      }
+    }
 
     if (should_print) {
       std::lock_guard<std::mutex> lock(DebugMutex());
-      bool print_header = !debug_header_printed_ ||
-                          (debug_print_count_ % kDebugHeaderRepeat) == 0;
       if (print_header) {
         std::cout << BuildDebugHeader();
-        debug_header_printed_ = true;
       }
-      std::cout << BuildDebugRow(data->time, net_grf, contact_info,
+      std::cout << BuildDebugRow(current_time, net_grf, contact_info,
                                  hind_alignment)
                 << std::flush;
-      ++debug_print_count_;
-      debug_last_print_time_ = data->time;
     }
-  } else if (debug_header_printed_ || debug_print_count_ > 0) {
-    debug_header_printed_ = false;
-    debug_print_count_ = 0;
-    debug_last_print_time_ = -std::numeric_limits<double>::infinity();
+  } else {
+    auto state = debug_log_state_;
+    std::lock_guard<std::mutex> state_lock(state->state_mutex);
+    state->header_printed = false;
+    state->print_count = 0;
+    state->last_print_time = -std::numeric_limits<double>::infinity();
+    state->next_print_time = -std::numeric_limits<double>::infinity();
   }
 
   if (hind_grf_align_sensor_id_ >= 0) {
@@ -737,6 +783,17 @@ constexpr float kHullRgba[4] = {0.4, 0.2, 0.8, 1};  // convex hull
 constexpr float kAvgRgba[4] = {0.4, 0.2, 0.8, 1};   // average foot position
 constexpr float kCapRgba[4] = {0.3, 0.3, 0.8, 1};   // capture point
 constexpr float kPcpRgba[4] = {0.5, 0.5, 0.2, 1};   // projected capture point
+constexpr float kPlaneRgba[4] = {0.2f, 0.8f, 0.8f, 0.25f};            // contact plane
+constexpr float kGrfVectorRgba[4] = {0.95f, 0.25f, 0.25f, 1.0f};   // GRF vector
+constexpr float kMotorVectorRgba[4] = {0.2f, 0.55f, 0.95f, 1.0f};  // motor vector
+constexpr float kPlanePointRgba[3][4] = {
+  {0.85f, 0.25f, 0.25f, 1.0f},  // hip anchor
+  {0.25f, 0.85f, 0.25f, 1.0f},  // knee anchor
+  {0.25f, 0.25f, 0.85f, 1.0f}   // contact / foot point
+};
+constexpr double kGrfVectorScale = 1; //5e-4;                            // GRF scaling
+constexpr double kVectorMaxLength = 0.3;                            // max vector len
+constexpr double kVectorWidth = 0.01;                              // vector thickness
 
 // draw task-related geometry in the scene
 void QuadrupedFlat::ModifyScene(const mjModel* model, const mjData* data,
@@ -763,6 +820,90 @@ void QuadrupedFlat::ModifyScene(const mjModel* model, const mjData* data,
   double* foot_pos[ResidualFn::kNumFoot];
   for (ResidualFn::A1Foot foot : ResidualFn::kFootAll)
     foot_pos[foot] = data->geom_xpos + 3 * residual_.foot_geom_id_[foot];
+
+  FootContactInfo contact_info[ResidualFn::kNumFoot];
+
+  for (int i = 0; i < data->ncon; ++i) {
+    const mjContact& contact = data->contact[i];
+    int foot_index = -1;
+    double sign = 1.0;
+
+    for (ResidualFn::A1Foot candidate : ResidualFn::kFootAll) {
+      if (residual_.foot_geom_id_[candidate] == contact.geom1) {
+        foot_index = static_cast<int>(candidate);
+        break;
+      }
+    }
+    if (foot_index < 0) {
+      for (ResidualFn::A1Foot candidate : ResidualFn::kFootAll) {
+        if (residual_.foot_geom_id_[candidate] == contact.geom2) {
+          foot_index = static_cast<int>(candidate);
+          sign = -1.0;
+          break;
+        }
+      }
+    }
+    if (foot_index < 0) continue;
+
+    mjtNum contact_force[6];
+    mj_contactForce(model, data, i, contact_force);
+    mjtNum local_force[3] = {contact_force[0], contact_force[1], contact_force[2]};
+    mjtNum world_force_tmp[3];
+    mju_mulMatVec(world_force_tmp, contact.frame, local_force, 3, 3);
+    double world_force[3] = {static_cast<double>(world_force_tmp[0]),
+                             static_cast<double>(world_force_tmp[1]),
+                             static_cast<double>(world_force_tmp[2])};
+    if (sign < 0) {
+      world_force[0] *= -1.0;
+      world_force[1] *= -1.0;
+      world_force[2] *= -1.0;
+    }
+
+    FootContactInfo& info = contact_info[foot_index];
+    mju_addTo3(info.force, world_force);
+    double force_magnitude = mju_norm3(world_force);
+    if (force_magnitude > kForceThreshold) {
+      info.in_contact = true;
+    }
+    info.weight += force_magnitude;
+    if (force_magnitude > 0.0) {
+      double contact_pos[3] = {static_cast<double>(contact.pos[0]),
+                               static_cast<double>(contact.pos[1]),
+                               static_cast<double>(contact.pos[2])};
+      mju_addToScl3(info.point, contact_pos, force_magnitude);
+    }
+
+    double normal_world[3] = {static_cast<double>(contact.frame[6]),
+                              static_cast<double>(contact.frame[7]),
+                              static_cast<double>(contact.frame[8])};
+    if (sign < 0) {
+      normal_world[0] *= -1.0;
+      normal_world[1] *= -1.0;
+      normal_world[2] *= -1.0;
+    }
+    mju_addTo3(info.normal, normal_world);
+  }
+
+  for (ResidualFn::A1Foot foot : ResidualFn::kFootAll) {
+    FootContactInfo& info = contact_info[foot];
+    if (info.weight > kForceThreshold) {
+      double inv = 1.0 / info.weight;
+      mju_scl3(info.point, info.point, inv);
+    } else {
+      info.point[0] = foot_pos[foot][0];
+      info.point[1] = foot_pos[foot][1];
+      info.point[2] = foot_pos[foot][2];
+    }
+    if (mju_norm3(info.force) < kForceThreshold) {
+      info.in_contact = false;
+    }
+    double norm = mju_norm3(info.normal);
+    if (norm > kPlaneProjectionEps) {
+      mju_scl3(info.normal, info.normal, 1.0 / norm);
+    } else {
+      info.normal[0] = info.normal[1] = info.normal[2] = 0.0;
+    }
+  }
 
   // stance and flight positions
   double flight_pos[ResidualFn::kNumFoot][3];
@@ -850,6 +991,198 @@ void QuadrupedFlat::ModifyScene(const mjModel* model, const mjData* data,
   NearestInHull(pcp2, capture, polygon, hull, num_hull);
   double pcp[3] = {pcp2[0], pcp2[1], com_ground};
   AddGeom(scene, mjGEOM_SPHERE, foot_size, pcp, /*mat=*/nullptr, kPcpRgba);
+
+  auto visualize_alignment_plane = [&](ResidualFn::A1Foot foot) {
+    FootContactInfo& info = contact_info[foot];
+    // Visualize the alignment plane only for the hind-left foot.
+    int knee_joint = residual_.knee_joint_id_[foot];
+    int hip_joint = residual_.hip_joint_id_[foot];
+    if (knee_joint < 0 || hip_joint < 0) {
+      return;
+    }
+
+    // `xanchor` entries are laid out per joint (njnt).
+    const mjtNum* knee_anchor_ptr = data->xanchor + 3 * knee_joint;
+    const mjtNum* hip_anchor_ptr = data->xanchor + 3 * hip_joint;
+
+    double knee_anchor[3];
+    double hip_anchor[3];
+    mju_copy3(knee_anchor, knee_anchor_ptr);
+    mju_copy3(hip_anchor, hip_anchor_ptr);
+
+    double foot_point[3];
+    if (info.in_contact) {
+      mju_copy3(foot_point, info.point);
+    } else {
+      mju_copy3(foot_point, foot_pos[foot]);
+    }
+
+    double plane_vec1[3];  // hip -> knee
+    double plane_vec2[3];  // knee -> foot
+    mju_sub3(plane_vec1, hip_anchor, knee_anchor);
+    mju_sub3(plane_vec2, foot_point, knee_anchor);
+    double plane_normal[3];
+    mju_cross(plane_normal, plane_vec1, plane_vec2);
+    if (mju_norm3(plane_normal) < kPlaneProjectionEps) {
+      return;
+    }
+    double vec1_norm = mju_norm3(plane_vec1);
+    double vec2_norm = mju_norm3(plane_vec2);
+    if (vec1_norm < kPlaneProjectionEps || vec2_norm < kPlaneProjectionEps) {
+      return;
+    }
+
+    double plane_u[3];
+    double plane_v[3];
+    mju_copy3(plane_u, plane_vec1);
+    mju_copy3(plane_v, plane_vec2);
+    mju_scl3(plane_u, plane_u, 1.0 / vec1_norm);
+    mju_scl3(plane_v, plane_v, 1.0 / vec2_norm);
+    double plane_normal_unit[3];
+    mju_copy3(plane_normal_unit, plane_normal);
+    mju_normalize3(plane_normal_unit);
+
+    mjtNum plane_center[3] = {
+        static_cast<mjtNum>((foot_point[0] + knee_anchor[0] + hip_anchor[0]) /
+                            3.0),
+        static_cast<mjtNum>((foot_point[1] + knee_anchor[1] + hip_anchor[1]) /
+                            3.0),
+        static_cast<mjtNum>((foot_point[2] + knee_anchor[2] + hip_anchor[2]) /
+                            3.0)};
+    mju_addToScl3(plane_center, plane_normal_unit, 0.001);
+
+    double size0 = vec1_norm;
+    double size1 = vec2_norm;
+    mjtNum plane_size[3] = {
+        static_cast<mjtNum>(mju_max(size0, 0.02)),
+        static_cast<mjtNum>(mju_max(size1, 0.02)),
+        0.001};
+    mjtNum plane_mat[9] = {
+        static_cast<mjtNum>(plane_u[0]),
+        static_cast<mjtNum>(plane_v[0]),
+        static_cast<mjtNum>(plane_normal_unit[0]),
+        static_cast<mjtNum>(plane_u[1]),
+        static_cast<mjtNum>(plane_v[1]),
+        static_cast<mjtNum>(plane_normal_unit[1]),
+        static_cast<mjtNum>(plane_u[2]),
+        static_cast<mjtNum>(plane_v[2]),
+        static_cast<mjtNum>(plane_normal_unit[2])};
+
+    AddGeom(scene, mjGEOM_BOX, plane_size, plane_center, plane_mat,
+            kPlaneRgba);
+
+    double point_size[3] = {0.03, 0.0, 0.0};
+    mjtNum hip_point[3] = {static_cast<mjtNum>(hip_anchor[0]),
+                           static_cast<mjtNum>(hip_anchor[1]),
+                           static_cast<mjtNum>(hip_anchor[2])};
+    mjtNum knee_point[3] = {static_cast<mjtNum>(knee_anchor[0]),
+                            static_cast<mjtNum>(knee_anchor[1]),
+                            static_cast<mjtNum>(knee_anchor[2])};
+    mjtNum contact_point[3] = {static_cast<mjtNum>(foot_point[0]),
+                               static_cast<mjtNum>(foot_point[1]),
+                               static_cast<mjtNum>(foot_point[2])};
+    AddGeom(scene, mjGEOM_SPHERE, point_size, hip_point, /*mat=*/nullptr,
+            kPlanePointRgba[0]);
+    AddGeom(scene, mjGEOM_SPHERE, point_size, knee_point, /*mat=*/nullptr,
+            kPlanePointRgba[1]);
+    AddGeom(scene, mjGEOM_SPHERE, point_size, contact_point, /*mat=*/nullptr,
+            kPlanePointRgba[2]);
+
+    if (!info.in_contact) {
+      return;
+    }
+
+    double grf_proj[3];
+    ProjectOntoPlane(grf_proj, info.force, plane_normal_unit);
+    double grf_proj_norm = mju_norm3(grf_proj);
+    if (grf_proj_norm < kPlaneProjectionEps) {
+      return;
+    }
+    double grf_dir[3];
+    mju_copy3(grf_dir, grf_proj);
+    mju_scl3(grf_dir, grf_dir, 1.0 / grf_proj_norm);
+
+    double thigh_vec[3];
+    double shank_vec[3];
+    mju_sub3(thigh_vec, knee_anchor, hip_anchor);   // hip -> knee
+    mju_sub3(shank_vec, foot_point, knee_anchor);   // knee -> foot
+
+    double thigh_proj[3];
+    double shank_proj[3];
+    ProjectOntoPlane(thigh_proj, thigh_vec, plane_normal_unit);
+    ProjectOntoPlane(shank_proj, shank_vec, plane_normal_unit);
+
+    double best_motor_proj[3] = {0.0, 0.0, 0.0};
+    double min_perp_distance = mjMAXVAL;
+    bool has_motor = false;
+
+    auto consider_motor = [&](const double motor_proj[3]) {
+      double norm = mju_norm3(motor_proj);
+      if (norm < kPlaneProjectionEps) return;
+
+      double parallel = mju_dot3(motor_proj, grf_dir);
+      if (parallel <= 0.0) {
+        // Ранее мы принимали такие моторы и вектор визуализации мог развернуться
+        // назад вдоль пола. Игнорируем их, чтобы оставался только мотор,
+        // поддерживающий направление проекции ГРФ.
+        return;
+      }
+
+      double closest_point[3];
+      mju_scl3(closest_point, grf_dir, parallel);
+      double diff[3];
+      mju_sub3(diff, motor_proj, closest_point);
+      double distance = mju_norm3(diff);
+      if (distance < min_perp_distance) {
+        min_perp_distance = distance;
+        mju_copy3(best_motor_proj, motor_proj);
+        has_motor = true;
+      }
+    };
+
+    consider_motor(thigh_proj);
+    consider_motor(shank_proj);
+
+    if (!has_motor) {
+      return;
+    }
+
+    double grf_draw[3];
+    mju_copy3(grf_draw, grf_proj);
+    mju_scl3(grf_draw, grf_draw, kGrfVectorScale);
+    double grf_length = mju_norm3(grf_draw);
+    if (grf_length > kVectorMaxLength && grf_length > 0) {
+      mju_scl3(grf_draw, grf_draw, kVectorMaxLength / grf_length);
+    }
+
+    double motor_draw[3];
+    mju_copy3(motor_draw, best_motor_proj);
+    double motor_length = mju_norm3(motor_draw);
+    if (motor_length > kVectorMaxLength && motor_length > 0) {
+      mju_scl3(motor_draw, motor_draw, kVectorMaxLength / motor_length);
+    }
+
+    mjtNum from[3] = {foot_point[0], foot_point[1], foot_point[2]};
+    mjtNum grf_to[3] = {foot_point[0] + grf_draw[0],
+                        foot_point[1] + grf_draw[1],
+                        foot_point[2] + grf_draw[2]};
+    mjtNum motor_from[3] = {static_cast<mjtNum>(foot_point[0]),
+                            static_cast<mjtNum>(foot_point[1]),
+                            static_cast<mjtNum>(foot_point[2])};
+    mjtNum motor_to[3] = {
+        static_cast<mjtNum>(foot_point[0] + motor_draw[0]),
+        static_cast<mjtNum>(foot_point[1] + motor_draw[1]),
+        static_cast<mjtNum>(foot_point[2] + motor_draw[2])};
+
+    AddConnector(scene, mjGEOM_CAPSULE, kVectorWidth, from, grf_to,
+                 kGrfVectorRgba);
+    AddConnector(scene, mjGEOM_CAPSULE, kVectorWidth, motor_from, motor_to,
+                 kMotorVectorRgba);
+  };
+
+  for (int hind_idx = 0; hind_idx < 2; ++hind_idx) {
+    visualize_alignment_plane(ResidualFn::kFootHind[hind_idx]);
+  }
 }
 
 //  ============  task-state utilities  ============
@@ -902,9 +1235,14 @@ void QuadrupedFlat::ResetLocked(const mjModel* model) {
   residual_.debug_grf_param_id_ = ParameterIndex(model, "Debug GRF log");
   residual_.hind_grf_align_sensor_id_ =
       mj_name2id(model, mjOBJ_SENSOR, "Hind GRF Align");
-  residual_.debug_header_printed_ = false;
-  residual_.debug_print_count_ = 0;
-  residual_.debug_last_print_time_ = -std::numeric_limits<double>::infinity();
+  {
+    auto state = residual_.debug_log_state_;
+    std::lock_guard<std::mutex> state_lock(state->state_mutex);
+    state->header_printed = false;
+    state->print_count = 0;
+    state->last_print_time = -std::numeric_limits<double>::infinity();
+    state->next_print_time = -std::numeric_limits<double>::infinity();
+  }
 
   for (int foot = 0; foot < ResidualFn::kNumFoot; ++foot) {
     const char* abduction_joint =

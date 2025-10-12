@@ -110,7 +110,7 @@
     <user name="Posture" dim="12" user="0 0.02 0.0 0.1" />
     <user name="Orientation" dim="2" user="0 0 0 .03" />
     <user name="Angmom" dim="3" user="0 0 0 .03" />
-  <user name="GRF" dim="3" user="0.01 0.00001 0 0.00001 0.00001" />
+  <user name="GRF" dim="3" user="0.01 0.0000 0 0.00001 0.00001" />
   <!-- <user name="Hind GRF Align" dim="2" user="0.01 0.00001 0 0.00001 0.00001" /> -->
 
     <!-- estimator measurements -->

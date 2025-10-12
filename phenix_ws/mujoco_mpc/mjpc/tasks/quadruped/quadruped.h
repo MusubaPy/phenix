@@ -16,6 +16,8 @@
 #define MJPC_TASKS_QUADRUPED_QUADRUPED_H_
 
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -30,8 +32,9 @@ class QuadrupedFlat : public Task {
   std::string XmlPath() const override;
   class ResidualFn : public mjpc::BaseResidualFn {
    public:
-    explicit ResidualFn(const QuadrupedFlat* task)
-        : mjpc::BaseResidualFn(task) {}
+  explicit ResidualFn(const QuadrupedFlat* task)
+    : mjpc::BaseResidualFn(task),
+      debug_log_state_(std::make_shared<DebugLogState>()) {}
     ResidualFn(const ResidualFn&) = default;
     void Residual(const mjModel* model, const mjData* data,
                   double* residual) const override;
@@ -242,10 +245,16 @@ class QuadrupedFlat : public Task {
     double land_rot_acc_      = 0;
     double total_mass_        = 0;
 
-    // debug logging state
-    mutable bool debug_header_printed_ = false;
-    mutable int debug_print_count_ = 0;
-    mutable double debug_last_print_time_ = -std::numeric_limits<double>::infinity();
+    // debug logging state shared across residual copies
+    struct DebugLogState {
+      std::mutex state_mutex;
+      bool header_printed = false;
+      int print_count = 0;
+      double last_print_time = -std::numeric_limits<double>::infinity();
+      double next_print_time = -std::numeric_limits<double>::infinity();
+    };
+
+    mutable std::shared_ptr<DebugLogState> debug_log_state_;
   };
 
   QuadrupedFlat() : residual_(this) {}
