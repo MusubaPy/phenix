@@ -499,38 +499,39 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
       mju_scl3(plane_normal, plane_normal, -1.0);
     }
 
-    double normal_proj[3];
-    ProjectOntoPlane(normal_proj, info.normal, plane_normal);
-    if (mju_norm3(normal_proj) < kPlaneProjectionEps) {
+    double grf_proj[3];
+    ProjectOntoPlane(grf_proj, info.force, plane_normal);
+    double grf_proj_norm = mju_norm3(grf_proj);
+    if (grf_proj_norm < kPlaneProjectionEps) {
       hind_alignment[hind_idx] = 0.0;
       continue;
     }
 
     double best_motor_proj[3] = {0.0, 0.0, 0.0};
-    double smallest_angle = mjMAXVAL;
+    double best_alignment = -1.0;
     double candidate_vectors[2][3];
     mju_sub3(candidate_vectors[0], anchors[2], anchors[1]);       // hip -> knee
     mju_sub3(candidate_vectors[1], foot_point, anchors[2]);       // knee -> foot
     for (int candidate = 0; candidate < 2; ++candidate) {
       double motor_proj[3];
       ProjectOntoPlane(motor_proj, candidate_vectors[candidate], plane_normal);
-      if (mju_norm3(motor_proj) < kPlaneProjectionEps) {
+      double motor_norm = mju_norm3(motor_proj);
+      if (motor_norm < kPlaneProjectionEps) {
         continue;
       }
-      double angle = AngleBetween(normal_proj, motor_proj);
-      if (angle < smallest_angle) {
-        smallest_angle = angle;
-        mju_copy3(best_motor_proj, motor_proj);
+      double dot = mju_dot3(motor_proj, grf_proj) / (motor_norm * grf_proj_norm);
+      dot = mju_clip(dot, -1.0, 1.0);
+      double alignment = std::abs(dot);
+      if (alignment > best_alignment) {
+        best_alignment = alignment;
+        if (dot < 0.0) {
+          mju_scl3(best_motor_proj, motor_proj, -1.0);
+        } else {
+          mju_copy3(best_motor_proj, motor_proj);
+        }
       }
     }
-    if (smallest_angle == mjMAXVAL) {
-      hind_alignment[hind_idx] = 0.0;
-      continue;
-    }
-
-  double grf_proj[3];
-  ProjectOntoPlane(grf_proj, info.force, plane_normal);
-    if (mju_norm3(grf_proj) < kPlaneProjectionEps) {
+    if (best_alignment < 0.0) {
       hind_alignment[hind_idx] = 0.0;
       continue;
     }
@@ -1071,7 +1072,7 @@ void QuadrupedFlat::ModifyScene(const mjModel* model, const mjData* data,
     AddGeom(scene, mjGEOM_BOX, plane_size, plane_center, plane_mat,
             kPlaneRgba);
 
-    double point_size[3] = {0.03, 0.0, 0.0};
+    double point_size[3] = {0.025, 0.0, 0.0};
     mjtNum hip_point[3] = {static_cast<mjtNum>(hip_anchor[0]),
                            static_cast<mjtNum>(hip_anchor[1]),
                            static_cast<mjtNum>(hip_anchor[2])};
@@ -1098,9 +1099,6 @@ void QuadrupedFlat::ModifyScene(const mjModel* model, const mjData* data,
     if (grf_proj_norm < kPlaneProjectionEps) {
       return;
     }
-    double grf_dir[3];
-    mju_copy3(grf_dir, grf_proj);
-    mju_scl3(grf_dir, grf_dir, 1.0 / grf_proj_norm);
 
     double thigh_vec[3];
     double shank_vec[3];
@@ -1112,40 +1110,28 @@ void QuadrupedFlat::ModifyScene(const mjModel* model, const mjData* data,
     ProjectOntoPlane(thigh_proj, thigh_vec, plane_normal_unit);
     ProjectOntoPlane(shank_proj, shank_vec, plane_normal_unit);
 
-    double best_motor_proj[3] = {0.0, 0.0, 0.0};
-    double min_perp_distance = mjMAXVAL;
+    double best_alignment = -1.0;
     bool has_motor = false;
+    int best_candidate = -1;
 
-    auto consider_motor = [&](const double motor_proj[3]) {
-      double norm = mju_norm3(motor_proj);
-      if (norm < kPlaneProjectionEps) return;
+    auto consider_motor = [&](int candidate, const double motor_proj_in[3]) {
+      double motor_proj[3];
+      mju_copy3(motor_proj, motor_proj_in);
+      double motor_norm = mju_norm3(motor_proj);
+      if (motor_norm < kPlaneProjectionEps) return;
 
-      double parallel = mju_dot3(motor_proj, grf_dir);
-      if (parallel <= 0.0) {
-        // Ранее мы принимали такие моторы и вектор визуализации мог развернуться
-        // назад вдоль пола. Игнорируем их, чтобы оставался только мотор,
-        // поддерживающий направление проекции ГРФ.
-        return;
-      }
-
-      double closest_point[3];
-      mju_scl3(closest_point, grf_dir, parallel);
-      double diff[3];
-      mju_sub3(diff, motor_proj, closest_point);
-      double distance = mju_norm3(diff);
-      if (distance < min_perp_distance) {
-        min_perp_distance = distance;
-        mju_copy3(best_motor_proj, motor_proj);
+      double dot = mju_dot3(motor_proj, grf_proj) / (motor_norm * grf_proj_norm);
+      dot = mju_clip(dot, -1.0, 1.0);
+      double alignment = std::abs(dot);
+      if (alignment > best_alignment) {
+        best_alignment = alignment;
         has_motor = true;
+        best_candidate = candidate;
       }
     };
 
-    consider_motor(thigh_proj);
-    consider_motor(shank_proj);
-
-    if (!has_motor) {
-      return;
-    }
+    consider_motor(0, thigh_proj);
+    consider_motor(1, shank_proj);
 
     double grf_draw[3];
     mju_copy3(grf_draw, grf_proj);
@@ -1155,29 +1141,24 @@ void QuadrupedFlat::ModifyScene(const mjModel* model, const mjData* data,
       mju_scl3(grf_draw, grf_draw, kVectorMaxLength / grf_length);
     }
 
-    double motor_draw[3];
-    mju_copy3(motor_draw, best_motor_proj);
-    double motor_length = mju_norm3(motor_draw);
-    if (motor_length > kVectorMaxLength && motor_length > 0) {
-      mju_scl3(motor_draw, motor_draw, kVectorMaxLength / motor_length);
-    }
-
     mjtNum from[3] = {foot_point[0], foot_point[1], foot_point[2]};
     mjtNum grf_to[3] = {foot_point[0] + grf_draw[0],
                         foot_point[1] + grf_draw[1],
                         foot_point[2] + grf_draw[2]};
-    mjtNum motor_from[3] = {static_cast<mjtNum>(foot_point[0]),
-                            static_cast<mjtNum>(foot_point[1]),
-                            static_cast<mjtNum>(foot_point[2])};
-    mjtNum motor_to[3] = {
-        static_cast<mjtNum>(foot_point[0] + motor_draw[0]),
-        static_cast<mjtNum>(foot_point[1] + motor_draw[1]),
-        static_cast<mjtNum>(foot_point[2] + motor_draw[2])};
 
     AddConnector(scene, mjGEOM_CAPSULE, kVectorWidth, from, grf_to,
                  kGrfVectorRgba);
-    AddConnector(scene, mjGEOM_CAPSULE, kVectorWidth, motor_from, motor_to,
-                 kMotorVectorRgba);
+    if (has_motor && best_candidate >= 0) {
+      const double* anchor_target = (best_candidate == 0) ? hip_anchor : knee_anchor;
+      mjtNum motor_from[3] = {static_cast<mjtNum>(foot_point[0]),
+                              static_cast<mjtNum>(foot_point[1]),
+                              static_cast<mjtNum>(foot_point[2])};
+      mjtNum motor_to[3] = {static_cast<mjtNum>(anchor_target[0]),
+                            static_cast<mjtNum>(anchor_target[1]),
+                            static_cast<mjtNum>(anchor_target[2])};
+      AddConnector(scene, mjGEOM_CAPSULE, kVectorWidth, motor_from, motor_to,
+                   kMotorVectorRgba);
+    }
   };
 
   for (int hind_idx = 0; hind_idx < 2; ++hind_idx) {
