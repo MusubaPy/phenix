@@ -145,6 +145,55 @@ double AngleBetween(const double a[3], const double b[3]) {
   dot = mju_clip(dot, -1.0, 1.0);
   return std::acos(dot);
 }
+
+// Chooses the motor vector whose projection aligns best with the projected
+// contact normal; returns the projected motor and normal for reuse.
+struct MotorSelectionResult {
+  int index;
+  double angle;
+  double motor_proj[3];
+  double normal_proj[3];
+};
+
+MotorSelectionResult SelectMotorUsingNormal(const double contact_normal[3],
+                                            const double motor_vectors[2][3],
+                                            const double plane_normal[3]) {
+  MotorSelectionResult result{-1, 0.0, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
+
+  double normal_proj[3];
+  ProjectOntoPlane(normal_proj, contact_normal, plane_normal);
+  mju_copy3(result.normal_proj, normal_proj);
+  double normal_norm = mju_norm3(normal_proj);
+  if (normal_norm < kPlaneProjectionEps) {
+    return result;
+  }
+
+  double best_angle = std::numeric_limits<double>::infinity();
+  int best_candidate = -1;
+  double best_motor_proj[3] = {0.0, 0.0, 0.0};
+
+  for (int candidate = 0; candidate < 2; ++candidate) {
+    double motor_proj[3];
+    ProjectOntoPlane(motor_proj, motor_vectors[candidate], plane_normal);
+    double motor_norm = mju_norm3(motor_proj);
+    if (motor_norm < kPlaneProjectionEps) {
+      continue;
+    }
+    double angle = AngleBetween(normal_proj, motor_proj);
+    if (angle < best_angle) {
+      best_angle = angle;
+      best_candidate = candidate;
+      mju_copy3(best_motor_proj, motor_proj);
+    }
+  }
+
+  if (best_candidate >= 0) {
+    result.index = best_candidate;
+    result.angle = best_angle;
+    mju_copy3(result.motor_proj, best_motor_proj);
+  }
+  return result;
+}
 }  // namespace
 
 namespace mjpc {
@@ -285,24 +334,31 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
   residual[counter++] = capture_point[1] - avg_foot_pos[1];
 
   // ---------- Ground reaction force collection ----------
-  for (int i = 0; i < data->ncon; ++i) {
-    const mjContact& contact = data->contact[i];
-    int foot_index = -1;
-    double sign = 1.0;
-    for (A1Foot candidate : kFootAll) {
-      if (foot_geom_id_[candidate] == contact.geom1) {
-        foot_index = static_cast<int>(candidate);
-        break;
-      }
+  auto FootIndexForGeom = [&](int geom_id) -> int {
+    if (geom_id < 0) {
+      return -1;
     }
-    if (foot_index < 0) {
-      for (A1Foot candidate : kFootAll) {
-        if (foot_geom_id_[candidate] == contact.geom2) {
-          foot_index = static_cast<int>(candidate);
-          sign = -1.0;
-          break;
+    int body = model->geom_bodyid[geom_id];
+    while (body >= 0) {
+      for (int candidate = 0; candidate < kNumFoot; ++candidate) {
+        if (body == shoulder_body_id_[candidate]) {
+          return candidate;
         }
       }
+      int parent = model->body_parentid[body];
+      if (parent == body) {
+        break;
+      }
+      body = parent;
+    }
+    return -1;
+  };
+  for (int i = 0; i < data->ncon; ++i) {
+    const mjContact& contact = data->contact[i];
+    int foot_index = FootIndexForGeom(contact.geom1);
+    bool foot_from_geom1 = foot_index >= 0;
+    if (!foot_from_geom1) {
+      foot_index = FootIndexForGeom(contact.geom2);
     }
     if (foot_index < 0) {
       continue;
@@ -313,11 +369,11 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
     mjtNum local_force[3] = {contact_force[0], contact_force[1],
                              contact_force[2]};
     mjtNum world_force_tmp[3];
-    mju_mulMatVec(world_force_tmp, contact.frame, local_force, 3, 3);
+    mju_mulMatTVec(world_force_tmp, contact.frame, local_force, 3, 3);
     double world_force[3] = {static_cast<double>(world_force_tmp[0]),
                              static_cast<double>(world_force_tmp[1]),
                              static_cast<double>(world_force_tmp[2])};
-    if (sign < 0) {
+    if (foot_from_geom1) {
       world_force[0] *= -1.0;
       world_force[1] *= -1.0;
       world_force[2] *= -1.0;
@@ -338,10 +394,10 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
       mju_addToScl3(info.point, contact_pos, force_magnitude);
     }
 
-    double normal_world[3] = {static_cast<double>(contact.frame[6]),
-                              static_cast<double>(contact.frame[7]),
-                              static_cast<double>(contact.frame[8])};
-    if (sign < 0) {
+  double normal_world[3] = {static_cast<double>(contact.frame[0]),
+                static_cast<double>(contact.frame[1]),
+                static_cast<double>(contact.frame[2])};
+    if (foot_from_geom1) {
       normal_world[0] *= -1.0;
       normal_world[1] *= -1.0;
       normal_world[2] *= -1.0;
@@ -484,19 +540,34 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
       mju_copy3(foot_point, foot_pos[foot]);
     }
 
-    double plane_vec1[3];  // hip -> knee
-    double plane_vec2[3];  // knee -> foot contact
-    mju_sub3(plane_vec1, anchors[1], anchors[2]);
-    mju_sub3(plane_vec2, foot_point, anchors[2]);
+  double plane_vec1[3];  // knee -> hip
+  double plane_vec2[3];  // knee -> contact
+  mju_sub3(plane_vec1, anchors[1], anchors[2]);
+  mju_sub3(plane_vec2, foot_point, anchors[2]);
     double plane_normal[3];
     mju_cross(plane_normal, plane_vec1, plane_vec2);
     if (mju_norm3(plane_normal) < kPlaneProjectionEps) {
       hind_alignment[hind_idx] = 0.0;
       continue;
     }
+    double motor_vectors[2][3];
+    mju_sub3(motor_vectors[0], anchors[1], foot_point);  // contact -> hip
+    mju_sub3(motor_vectors[1], anchors[2], foot_point);  // contact -> knee
 
-    if (mju_dot3(plane_normal, info.normal) < 0) {
-      mju_scl3(plane_normal, plane_normal, -1.0);
+    double contact_normal[3];
+    mju_copy3(contact_normal, info.normal);
+
+    MotorSelectionResult selection =
+        SelectMotorUsingNormal(contact_normal, motor_vectors, plane_normal);
+    if (selection.index < 0) {
+      hind_alignment[hind_idx] = 0.0;
+      continue;
+    }
+
+    double motor_proj_norm = mju_norm3(selection.motor_proj);
+    if (motor_proj_norm < kPlaneProjectionEps) {
+      hind_alignment[hind_idx] = 0.0;
+      continue;
     }
 
     double grf_proj[3];
@@ -507,36 +578,7 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
       continue;
     }
 
-    double best_motor_proj[3] = {0.0, 0.0, 0.0};
-    double best_alignment = -1.0;
-    double candidate_vectors[2][3];
-    mju_sub3(candidate_vectors[0], anchors[2], anchors[1]);       // hip -> knee
-    mju_sub3(candidate_vectors[1], foot_point, anchors[2]);       // knee -> foot
-    for (int candidate = 0; candidate < 2; ++candidate) {
-      double motor_proj[3];
-      ProjectOntoPlane(motor_proj, candidate_vectors[candidate], plane_normal);
-      double motor_norm = mju_norm3(motor_proj);
-      if (motor_norm < kPlaneProjectionEps) {
-        continue;
-      }
-      double dot = mju_dot3(motor_proj, grf_proj) / (motor_norm * grf_proj_norm);
-      dot = mju_clip(dot, -1.0, 1.0);
-      double alignment = std::abs(dot);
-      if (alignment > best_alignment) {
-        best_alignment = alignment;
-        if (dot < 0.0) {
-          mju_scl3(best_motor_proj, motor_proj, -1.0);
-        } else {
-          mju_copy3(best_motor_proj, motor_proj);
-        }
-      }
-    }
-    if (best_alignment < 0.0) {
-      hind_alignment[hind_idx] = 0.0;
-      continue;
-    }
-
-    hind_alignment[hind_idx] = AngleBetween(grf_proj, best_motor_proj);
+    hind_alignment[hind_idx] = AngleBetween(grf_proj, selection.motor_proj);
   }
 
   bool debug_enabled =
@@ -585,6 +627,14 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
     if (should_print) {
       std::lock_guard<std::mutex> lock(DebugMutex());
       if (print_header) {
+        std::ostringstream gravity_stream;
+        gravity_stream << std::fixed << std::setprecision(3)
+                       << "gravity_for_net_grf[m/s^2]: ["
+                       << model->opt.gravity[0] << ' '
+                       << model->opt.gravity[1] << ' '
+                       << model->opt.gravity[2] << ']'
+                       << '\n';
+        std::cout << gravity_stream.str();
         std::cout << BuildDebugHeader();
       }
       std::cout << BuildDebugRow(current_time, net_grf, contact_info,
@@ -787,6 +837,8 @@ constexpr float kPcpRgba[4] = {0.5, 0.5, 0.2, 1};   // projected capture point
 constexpr float kPlaneRgba[4] = {0.2f, 0.8f, 0.8f, 0.25f};            // contact plane
 constexpr float kGrfVectorRgba[4] = {0.95f, 0.25f, 0.25f, 1.0f};   // GRF vector
 constexpr float kMotorVectorRgba[4] = {0.2f, 0.55f, 0.95f, 1.0f};  // motor vector
+constexpr float kNormalVectorRgba[4] = {0.85f, 0.85f, 0.25f, 1.0f}; // normal projection
+constexpr float kNetGrfVectorRgba[4] = {0.95f, 0.65f, 0.1f, 1.0f}; // net GRF vector
 constexpr float kPlanePointRgba[3][4] = {
   {0.85f, 0.25f, 0.25f, 1.0f},  // hip anchor
   {0.25f, 0.85f, 0.25f, 1.0f},  // knee anchor
@@ -823,26 +875,33 @@ void QuadrupedFlat::ModifyScene(const mjModel* model, const mjData* data,
     foot_pos[foot] = data->geom_xpos + 3 * residual_.foot_geom_id_[foot];
 
   FootContactInfo contact_info[ResidualFn::kNumFoot];
+  auto FootIndexForGeom = [&](int geom_id) -> int {
+    if (geom_id < 0) {
+      return -1;
+    }
+    int body = model->geom_bodyid[geom_id];
+    while (body >= 0) {
+      for (int candidate = 0; candidate < ResidualFn::kNumFoot; ++candidate) {
+        if (body == residual_.shoulder_body_id_[candidate]) {
+          return candidate;
+        }
+      }
+      int parent = model->body_parentid[body];
+      if (parent == body) {
+        break;
+      }
+      body = parent;
+    }
+    return -1;
+  };
+  double net_force[3] = {0.0, 0.0, 0.0};
 
   for (int i = 0; i < data->ncon; ++i) {
     const mjContact& contact = data->contact[i];
-    int foot_index = -1;
-    double sign = 1.0;
-
-    for (ResidualFn::A1Foot candidate : ResidualFn::kFootAll) {
-      if (residual_.foot_geom_id_[candidate] == contact.geom1) {
-        foot_index = static_cast<int>(candidate);
-        break;
-      }
-    }
-    if (foot_index < 0) {
-      for (ResidualFn::A1Foot candidate : ResidualFn::kFootAll) {
-        if (residual_.foot_geom_id_[candidate] == contact.geom2) {
-          foot_index = static_cast<int>(candidate);
-          sign = -1.0;
-          break;
-        }
-      }
+    int foot_index = FootIndexForGeom(contact.geom1);
+    bool foot_from_geom1 = foot_index >= 0;
+    if (!foot_from_geom1) {
+      foot_index = FootIndexForGeom(contact.geom2);
     }
     if (foot_index < 0) continue;
 
@@ -850,11 +909,11 @@ void QuadrupedFlat::ModifyScene(const mjModel* model, const mjData* data,
     mj_contactForce(model, data, i, contact_force);
     mjtNum local_force[3] = {contact_force[0], contact_force[1], contact_force[2]};
     mjtNum world_force_tmp[3];
-    mju_mulMatVec(world_force_tmp, contact.frame, local_force, 3, 3);
+    mju_mulMatTVec(world_force_tmp, contact.frame, local_force, 3, 3);
     double world_force[3] = {static_cast<double>(world_force_tmp[0]),
                              static_cast<double>(world_force_tmp[1]),
                              static_cast<double>(world_force_tmp[2])};
-    if (sign < 0) {
+    if (foot_from_geom1) {
       world_force[0] *= -1.0;
       world_force[1] *= -1.0;
       world_force[2] *= -1.0;
@@ -862,6 +921,7 @@ void QuadrupedFlat::ModifyScene(const mjModel* model, const mjData* data,
 
     FootContactInfo& info = contact_info[foot_index];
     mju_addTo3(info.force, world_force);
+    mju_addTo3(net_force, world_force);
     double force_magnitude = mju_norm3(world_force);
     if (force_magnitude > kForceThreshold) {
       info.in_contact = true;
@@ -874,10 +934,10 @@ void QuadrupedFlat::ModifyScene(const mjModel* model, const mjData* data,
       mju_addToScl3(info.point, contact_pos, force_magnitude);
     }
 
-    double normal_world[3] = {static_cast<double>(contact.frame[6]),
-                              static_cast<double>(contact.frame[7]),
-                              static_cast<double>(contact.frame[8])};
-    if (sign < 0) {
+  double normal_world[3] = {static_cast<double>(contact.frame[0]),
+                static_cast<double>(contact.frame[1]),
+                static_cast<double>(contact.frame[2])};
+    if (foot_from_geom1) {
       normal_world[0] *= -1.0;
       normal_world[1] *= -1.0;
       normal_world[2] *= -1.0;
@@ -973,6 +1033,24 @@ void QuadrupedFlat::ModifyScene(const mjModel* model, const mjData* data,
   // ground under CoM
   double com_ground = Ground(model, data, compos);
 
+  if (mju_norm3(net_force) > kForceThreshold) {
+    double net_draw[3];
+    mju_copy3(net_draw, net_force);
+    mju_scl3(net_draw, net_draw, kGrfVectorScale);
+    double net_length = mju_norm3(net_draw);
+    if (net_length > kVectorMaxLength && net_length > 0.0) {
+      mju_scl3(net_draw, net_draw, kVectorMaxLength / net_length);
+    }
+    mjtNum net_from[3] = {static_cast<mjtNum>(compos[0]),
+                          static_cast<mjtNum>(compos[1]),
+                          static_cast<mjtNum>(compos[2])};
+    mjtNum net_to[3] = {static_cast<mjtNum>(compos[0] + net_draw[0]),
+                        static_cast<mjtNum>(compos[1] + net_draw[1]),
+                        static_cast<mjtNum>(compos[2] + net_draw[2])};
+    AddConnector(scene, mjGEOM_CAPSULE, kVectorWidth, net_from, net_to,
+                 kNetGrfVectorRgba);
+  }
+
   // average foot position
   double feet_pos[3];
   residual_.AverageFootPos(feet_pos, foot_pos);
@@ -1018,8 +1096,8 @@ void QuadrupedFlat::ModifyScene(const mjModel* model, const mjData* data,
       mju_copy3(foot_point, foot_pos[foot]);
     }
 
-    double plane_vec1[3];  // hip -> knee
-    double plane_vec2[3];  // knee -> foot
+  double plane_vec1[3];  // knee -> hip
+  double plane_vec2[3];  // knee -> contact
     mju_sub3(plane_vec1, hip_anchor, knee_anchor);
     mju_sub3(plane_vec2, foot_point, knee_anchor);
     double plane_normal[3];
@@ -1093,45 +1171,24 @@ void QuadrupedFlat::ModifyScene(const mjModel* model, const mjData* data,
       return;
     }
 
-    double grf_proj[3];
-    ProjectOntoPlane(grf_proj, info.force, plane_normal_unit);
+  double grf_proj[3];
+  ProjectOntoPlane(grf_proj, info.force, plane_normal_unit);
     double grf_proj_norm = mju_norm3(grf_proj);
     if (grf_proj_norm < kPlaneProjectionEps) {
       return;
     }
 
-    double thigh_vec[3];
-    double shank_vec[3];
-    mju_sub3(thigh_vec, knee_anchor, hip_anchor);   // hip -> knee
-    mju_sub3(shank_vec, foot_point, knee_anchor);   // knee -> foot
+    double motor_vectors[2][3];
+    mju_sub3(motor_vectors[0], hip_anchor, foot_point);    // contact -> hip
+    mju_sub3(motor_vectors[1], knee_anchor, foot_point);   // contact -> knee
 
-    double thigh_proj[3];
-    double shank_proj[3];
-    ProjectOntoPlane(thigh_proj, thigh_vec, plane_normal_unit);
-    ProjectOntoPlane(shank_proj, shank_vec, plane_normal_unit);
+  double contact_normal[3];
+  mju_copy3(contact_normal, info.normal);
 
-    double best_alignment = -1.0;
-    bool has_motor = false;
-    int best_candidate = -1;
-
-    auto consider_motor = [&](int candidate, const double motor_proj_in[3]) {
-      double motor_proj[3];
-      mju_copy3(motor_proj, motor_proj_in);
-      double motor_norm = mju_norm3(motor_proj);
-      if (motor_norm < kPlaneProjectionEps) return;
-
-      double dot = mju_dot3(motor_proj, grf_proj) / (motor_norm * grf_proj_norm);
-      dot = mju_clip(dot, -1.0, 1.0);
-      double alignment = std::abs(dot);
-      if (alignment > best_alignment) {
-        best_alignment = alignment;
-        has_motor = true;
-        best_candidate = candidate;
-      }
-    };
-
-    consider_motor(0, thigh_proj);
-    consider_motor(1, shank_proj);
+    MotorSelectionResult selection =
+        SelectMotorUsingNormal(contact_normal, motor_vectors,
+                               plane_normal_unit);
+    int best_candidate = selection.index;
 
     double grf_draw[3];
     mju_copy3(grf_draw, grf_proj);
@@ -1148,7 +1205,23 @@ void QuadrupedFlat::ModifyScene(const mjModel* model, const mjData* data,
 
     AddConnector(scene, mjGEOM_CAPSULE, kVectorWidth, from, grf_to,
                  kGrfVectorRgba);
-    if (has_motor && best_candidate >= 0) {
+
+    double normal_proj_norm = mju_norm3(selection.normal_proj);
+    if (normal_proj_norm >= kPlaneProjectionEps) {
+      double normal_draw[3];
+      mju_copy3(normal_draw, selection.normal_proj);
+      mju_scl3(normal_draw, normal_draw, kGrfVectorScale);
+      double normal_length = mju_norm3(normal_draw);
+      if (normal_length > kVectorMaxLength && normal_length > 0) {
+        mju_scl3(normal_draw, normal_draw, kVectorMaxLength / normal_length);
+      }
+      mjtNum normal_to[3] = {foot_point[0] + normal_draw[0],
+                             foot_point[1] + normal_draw[1],
+                             foot_point[2] + normal_draw[2]};
+      AddConnector(scene, mjGEOM_CAPSULE, kVectorWidth, from, normal_to,
+                   kNormalVectorRgba);
+    }
+    if (best_candidate >= 0) {
       const double* anchor_target = (best_candidate == 0) ? hip_anchor : knee_anchor;
       mjtNum motor_from[3] = {static_cast<mjtNum>(foot_point[0]),
                               static_cast<mjtNum>(foot_point[1]),
