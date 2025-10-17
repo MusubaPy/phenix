@@ -75,6 +75,7 @@ class QuadrupedFlat : public Task {
     constexpr static A1Foot kFootAll[kNumFoot] = {kFootFL, kFootHL,
                                                   kFootFR, kFootHR};
     constexpr static A1Foot kFootHind[2] = {kFootHL, kFootHR};
+  constexpr static A1Foot kFootFront[2] = {kFootFL, kFootFR};
     constexpr static A1Gait kGaitAll[kNumGait] = {kGaitStand, kGaitWalk,
                                                   kGaitTrot, kGaitCanter,
                                                   kGaitGallop};

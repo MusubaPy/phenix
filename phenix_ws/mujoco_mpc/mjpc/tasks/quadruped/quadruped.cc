@@ -194,6 +194,49 @@ MotorSelectionResult SelectMotorUsingNormal(const double contact_normal[3],
   }
   return result;
 }
+
+struct PlaneData {
+  bool valid = false;
+  double foot_point[3] = {0.0, 0.0, 0.0};
+  double hip_anchor[3] = {0.0, 0.0, 0.0};
+  double knee_anchor[3] = {0.0, 0.0, 0.0};
+  double plane_normal[3] = {0.0, 0.0, 0.0};
+};
+
+bool ComputePlaneData(const mjData* data, const double* foot_pos,
+                      const FootContactInfo& info, int hip_joint,
+                      int knee_joint, PlaneData* plane) {
+  if (hip_joint < 0 || knee_joint < 0) {
+    return false;
+  }
+
+  const mjtNum* hip_anchor_ptr = data->xanchor + 3 * hip_joint;
+  const mjtNum* knee_anchor_ptr = data->xanchor + 3 * knee_joint;
+
+  mju_copy3(plane->hip_anchor, hip_anchor_ptr);
+  mju_copy3(plane->knee_anchor, knee_anchor_ptr);
+
+  if (info.in_contact) {
+    mju_copy3(plane->foot_point, info.point);
+  } else {
+    mju_copy3(plane->foot_point, foot_pos);
+  }
+
+  double vec_knee_hip[3];
+  double vec_knee_foot[3];
+  mju_sub3(vec_knee_hip, plane->hip_anchor, plane->knee_anchor);
+  mju_sub3(vec_knee_foot, plane->foot_point, plane->knee_anchor);
+
+  double plane_normal[3];
+  mju_cross(plane_normal, vec_knee_hip, vec_knee_foot);
+  if (mju_norm3(plane_normal) < kPlaneProjectionEps) {
+    return false;
+  }
+
+  mju_copy3(plane->plane_normal, plane_normal);
+  plane->valid = true;
+  return true;
+}
 }  // namespace
 
 namespace mjpc {
@@ -504,6 +547,25 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
 
   // ---------- Hind leg GRF alignment ----------
   double hind_alignment[2] = {0.0, 0.0};
+  double front_alignment[2] = {0.0, 0.0};
+  bool hind_reference_valid[2] = {false, false};
+  double hind_reference_vectors[2][3] = {{0.0, 0.0, 0.0},
+                                        {0.0, 0.0, 0.0}};
+  double front_force_z = 0.0;
+  double hind_force_positive_sum = 0.0;
+  int hind_contact_count = 0;
+  for (A1Foot foot : kFootAll) {
+    const FootContactInfo& info = contact_info[foot];
+    if (foot == kFootHL || foot == kFootHR) {
+      if (info.in_contact) {
+        hind_contact_count++;
+      }
+      hind_force_positive_sum += mju_max(info.force[2], 0.0);
+    } else {
+      front_force_z += info.force[2];
+    }
+  }
+  double target_hind_total_z = expected_contact[2] - front_force_z;
   for (int hind_idx = 0; hind_idx < 2; ++hind_idx) {
     A1Foot foot = kFootHind[hind_idx];
     FootContactInfo& info = contact_info[foot];
@@ -513,46 +575,17 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
       continue;
     }
 
-    int abduction_joint = abduction_joint_id_[foot];
-    int hip_joint = hip_joint_id_[foot];
-    int knee_joint = knee_joint_id_[foot];
-    if (abduction_joint < 0 || hip_joint < 0 || knee_joint < 0) {
+    PlaneData plane;
+    if (!ComputePlaneData(data, foot_pos[foot], info, hip_joint_id_[foot],
+                          knee_joint_id_[foot], &plane)) {
       hind_alignment[hind_idx] = 0.0;
       continue;
     }
-
-  // `xanchor` is stored per joint (njnt), so index by joint id directly.
-  const mjtNum* abduction_anchor_ptr =
-    data->xanchor + 3 * abduction_joint;
-  const mjtNum* hip_anchor_ptr =
-    data->xanchor + 3 * hip_joint;
-  const mjtNum* knee_anchor_ptr =
-    data->xanchor + 3 * knee_joint;
-    double anchors[3][3];
-    mju_copy3(anchors[0], abduction_anchor_ptr);
-    mju_copy3(anchors[1], hip_anchor_ptr);
-    mju_copy3(anchors[2], knee_anchor_ptr);
-
-    double foot_point[3];
-    if (info.in_contact) {
-      mju_copy3(foot_point, info.point);
-    } else {
-      mju_copy3(foot_point, foot_pos[foot]);
-    }
-
-  double plane_vec1[3];  // knee -> hip
-  double plane_vec2[3];  // knee -> contact
-  mju_sub3(plane_vec1, anchors[1], anchors[2]);
-  mju_sub3(plane_vec2, foot_point, anchors[2]);
-    double plane_normal[3];
-    mju_cross(plane_normal, plane_vec1, plane_vec2);
-    if (mju_norm3(plane_normal) < kPlaneProjectionEps) {
-      hind_alignment[hind_idx] = 0.0;
-      continue;
-    }
+  double plane_normal[3];
+  mju_copy3(plane_normal, plane.plane_normal);
     double motor_vectors[2][3];
-    mju_sub3(motor_vectors[0], anchors[1], foot_point);  // contact -> hip
-    mju_sub3(motor_vectors[1], anchors[2], foot_point);  // contact -> knee
+    mju_sub3(motor_vectors[0], plane.hip_anchor, plane.foot_point);
+    mju_sub3(motor_vectors[1], plane.knee_anchor, plane.foot_point);
 
     double contact_normal[3];
     mju_copy3(contact_normal, info.normal);
@@ -570,15 +603,86 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
       continue;
     }
 
+    double motor_dir[3];
+    mju_copy3(motor_dir, selection.motor_proj);
+    mju_scl3(motor_dir, motor_dir, 1.0 / motor_proj_norm);
+
+    double share;
+    if (hind_force_positive_sum >= kPlaneProjectionEps) {
+      share = mju_max(info.force[2], 0.0) / hind_force_positive_sum;
+    } else if (hind_contact_count > 0) {
+      share = 1.0 / hind_contact_count;
+    } else {
+      share = 0.0;
+    }
+    double target_leg_z = share * target_hind_total_z;
+
+    double desired_scale = motor_proj_norm;
+    double dir_z = motor_dir[2];
+    if (std::abs(dir_z) >= kPlaneProjectionEps) {
+      double candidate_scale = target_leg_z / dir_z;
+      if (candidate_scale >= 0.0) {
+        desired_scale = candidate_scale;
+      } else {
+        desired_scale = 0.0;
+      }
+    }
+
+    double target_proj[3];
+    mju_copy3(target_proj, motor_dir);
+    mju_scl3(target_proj, target_proj, desired_scale);
+
+  mju_copy3(selection.motor_proj, target_proj);
+
     double grf_proj[3];
     ProjectOntoPlane(grf_proj, info.force, plane_normal);
-    double grf_proj_norm = mju_norm3(grf_proj);
-    if (grf_proj_norm < kPlaneProjectionEps) {
-      hind_alignment[hind_idx] = 0.0;
+
+    double diff[3];
+    mju_sub3(diff, grf_proj, selection.motor_proj);
+    double diff_norm = mju_norm3(diff);
+    hind_alignment[hind_idx] = 0.5 * diff_norm * diff_norm;
+
+    hind_reference_valid[hind_idx] = true;
+    mju_copy3(hind_reference_vectors[hind_idx], selection.motor_proj);
+  }
+
+  // ---------- Front leg GRF alignment (mirrored reference) ----------
+  constexpr A1Foot kFrontFeet[2] = {kFootFront[0], kFootFront[1]};
+  constexpr A1Foot kDiagonalHind[2] = {kFootHR, kFootHL};
+  for (int front_idx = 0; front_idx < 2; ++front_idx) {
+    A1Foot foot = kFrontFeet[front_idx];
+    FootContactInfo& info = contact_info[foot];
+    if (!info.in_contact) {
+      front_alignment[front_idx] = 0.0;
       continue;
     }
 
-    hind_alignment[hind_idx] = AngleBetween(grf_proj, selection.motor_proj);
+    PlaneData plane;
+    if (!ComputePlaneData(data, foot_pos[foot], info, hip_joint_id_[foot],
+                          knee_joint_id_[foot], &plane)) {
+      front_alignment[front_idx] = 0.0;
+      continue;
+    }
+    double grf_proj[3];
+    ProjectOntoPlane(grf_proj, info.force, plane.plane_normal);
+
+    A1Foot diag_hind = kDiagonalHind[front_idx];
+    int diag_idx = (diag_hind == kFootHL) ? 0 : 1;
+    if (!hind_reference_valid[diag_idx]) {
+      front_alignment[front_idx] = 0.0;
+      continue;
+    }
+
+    double mirrored_ref[3] = {-hind_reference_vectors[diag_idx][0],
+                              -hind_reference_vectors[diag_idx][1],
+                               hind_reference_vectors[diag_idx][2]};
+    double reference_proj[3];
+    ProjectOntoPlane(reference_proj, mirrored_ref, plane.plane_normal);
+
+    double diff[3];
+    mju_sub3(diff, grf_proj, reference_proj);
+    double diff_norm = mju_norm3(diff);
+    front_alignment[front_idx] = 0.5 * diff_norm * diff_norm;
   }
 
   bool debug_enabled =
@@ -651,8 +755,16 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
   }
 
   if (hind_grf_align_sensor_id_ >= 0) {
-    residual[counter++] = hind_alignment[0];
-    residual[counter++] = hind_alignment[1];
+    int sensor_dim = model->sensor_dim[hind_grf_align_sensor_id_];
+    if (sensor_dim >= 4) {
+      residual[counter++] = hind_alignment[0];
+      residual[counter++] = hind_alignment[1];
+      residual[counter++] = front_alignment[0];
+      residual[counter++] = front_alignment[1];
+    } else {
+      residual[counter++] = hind_alignment[0] + front_alignment[0];
+      residual[counter++] = hind_alignment[1] + front_alignment[1];
+    }
   }
 
   // sensor dim sanity check
@@ -966,6 +1078,149 @@ void QuadrupedFlat::ModifyScene(const mjModel* model, const mjData* data,
     }
   }
 
+  PlaneData plane_data[ResidualFn::kNumFoot];
+  double hind_reference_vectors[2][3] = {{0.0, 0.0, 0.0},
+                                         {0.0, 0.0, 0.0}};
+  double front_reference_vectors[2][3] = {{0.0, 0.0, 0.0},
+                                          {0.0, 0.0, 0.0}};
+  bool hind_reference_valid[2] = {false, false};
+  bool front_reference_valid[2] = {false, false};
+  MotorSelectionResult hind_selection_data[2];
+  bool hind_selection_valid[2] = {false, false};
+  for (int i = 0; i < 2; ++i) {
+    hind_selection_data[i].index = -1;
+    hind_selection_data[i].angle = 0.0;
+    mju_zero3(hind_selection_data[i].motor_proj);
+    mju_zero3(hind_selection_data[i].normal_proj);
+  }
+
+  double expected_contact[3] = {model->opt.gravity[0], model->opt.gravity[1],
+                                model->opt.gravity[2]};
+  mju_scl3(expected_contact, expected_contact, -residual_.total_mass_);
+
+  double front_force_z = 0.0;
+  double hind_force_positive_sum = 0.0;
+  int hind_contact_count = 0;
+  for (ResidualFn::A1Foot foot : ResidualFn::kFootAll) {
+    const FootContactInfo& info = contact_info[foot];
+    if (foot == ResidualFn::kFootHL || foot == ResidualFn::kFootHR) {
+      if (info.in_contact) {
+        hind_contact_count++;
+      }
+      hind_force_positive_sum += mju_max(info.force[2], 0.0);
+    } else {
+      front_force_z += info.force[2];
+    }
+  }
+  double target_hind_total_z = expected_contact[2] - front_force_z;
+
+  for (int hind_idx = 0; hind_idx < 2; ++hind_idx) {
+    ResidualFn::A1Foot foot = ResidualFn::kFootHind[hind_idx];
+    FootContactInfo& info = contact_info[foot];
+
+    PlaneData plane;
+    if (!ComputePlaneData(data, foot_pos[foot], info,
+                          residual_.hip_joint_id_[foot],
+                          residual_.knee_joint_id_[foot], &plane)) {
+      continue;
+    }
+    plane_data[foot] = plane;
+
+    if (!info.in_contact) {
+      continue;
+    }
+
+    double motor_vectors[2][3];
+    mju_sub3(motor_vectors[0], plane.hip_anchor, plane.foot_point);
+    mju_sub3(motor_vectors[1], plane.knee_anchor, plane.foot_point);
+
+    double contact_normal[3];
+    mju_copy3(contact_normal, info.normal);
+
+    MotorSelectionResult selection =
+        SelectMotorUsingNormal(contact_normal, motor_vectors, plane.plane_normal);
+    if (selection.index < 0) {
+      continue;
+    }
+
+    double motor_proj_norm = mju_norm3(selection.motor_proj);
+    if (motor_proj_norm < kPlaneProjectionEps) {
+      continue;
+    }
+
+    double motor_dir[3];
+    mju_copy3(motor_dir, selection.motor_proj);
+    mju_scl3(motor_dir, motor_dir, 1.0 / motor_proj_norm);
+
+    double share;
+    if (hind_force_positive_sum >= kPlaneProjectionEps) {
+      share = mju_max(info.force[2], 0.0) / hind_force_positive_sum;
+    } else if (hind_contact_count > 0) {
+      share = 1.0 / hind_contact_count;
+    } else {
+      share = 0.0;
+    }
+    double target_leg_z = share * target_hind_total_z;
+
+    double desired_scale = motor_proj_norm;
+    double dir_z = motor_dir[2];
+    if (std::abs(dir_z) >= kPlaneProjectionEps) {
+      double candidate_scale = target_leg_z / dir_z;
+      if (candidate_scale >= 0.0) {
+        desired_scale = candidate_scale;
+      } else {
+        desired_scale = 0.0;
+      }
+    }
+
+    double target_proj[3];
+    mju_copy3(target_proj, motor_dir);
+    mju_scl3(target_proj, target_proj, desired_scale);
+
+    mju_copy3(selection.motor_proj, target_proj);
+
+    hind_reference_valid[hind_idx] = true;
+    hind_selection_valid[hind_idx] = true;
+    hind_selection_data[hind_idx] = selection;
+    mju_copy3(hind_reference_vectors[hind_idx], target_proj);
+  }
+
+  constexpr ResidualFn::A1Foot kFrontFeet[2] = {ResidualFn::kFootFront[0],
+                                                ResidualFn::kFootFront[1]};
+  constexpr ResidualFn::A1Foot kDiagonalHind[2] = {ResidualFn::kFootHR,
+                                                   ResidualFn::kFootHL};
+  for (int front_idx = 0; front_idx < 2; ++front_idx) {
+    ResidualFn::A1Foot foot = kFrontFeet[front_idx];
+    FootContactInfo& info = contact_info[foot];
+
+    PlaneData plane;
+    if (!ComputePlaneData(data, foot_pos[foot], info,
+                          residual_.hip_joint_id_[foot],
+                          residual_.knee_joint_id_[foot], &plane)) {
+      continue;
+    }
+    plane_data[foot] = plane;
+
+    if (!info.in_contact) {
+      continue;
+    }
+
+    ResidualFn::A1Foot diag_hind = kDiagonalHind[front_idx];
+    int diag_idx = (diag_hind == ResidualFn::kFootHL) ? 0 : 1;
+    if (!hind_reference_valid[diag_idx]) {
+      continue;
+    }
+
+    double mirrored_ref[3] = {-hind_reference_vectors[diag_idx][0],
+                              -hind_reference_vectors[diag_idx][1],
+                               hind_reference_vectors[diag_idx][2]};
+    double reference_proj[3];
+    ProjectOntoPlane(reference_proj, mirrored_ref, plane.plane_normal);
+
+    front_reference_valid[front_idx] = true;
+    mju_copy3(front_reference_vectors[front_idx], reference_proj);
+  }
+
   // stance and flight positions
   double flight_pos[ResidualFn::kNumFoot][3];
   double stance_pos[ResidualFn::kNumFoot][3];
@@ -1071,171 +1326,166 @@ void QuadrupedFlat::ModifyScene(const mjModel* model, const mjData* data,
   double pcp[3] = {pcp2[0], pcp2[1], com_ground};
   AddGeom(scene, mjGEOM_SPHERE, foot_size, pcp, /*mat=*/nullptr, kPcpRgba);
 
-  auto visualize_alignment_plane = [&](ResidualFn::A1Foot foot) {
-    FootContactInfo& info = contact_info[foot];
-    // Visualize the alignment plane only for the hind-left foot.
-    int knee_joint = residual_.knee_joint_id_[foot];
-    int hip_joint = residual_.hip_joint_id_[foot];
-    if (knee_joint < 0 || hip_joint < 0) {
-      return;
-    }
+  auto visualize_alignment_plane =
+      [&](ResidualFn::A1Foot foot, const double* reference_vector,
+          bool reference_valid, const MotorSelectionResult* selection_ptr) {
+        FootContactInfo& info = contact_info[foot];
+        const PlaneData& plane = plane_data[foot];
+        if (!plane.valid) {
+          return;
+        }
 
-    // `xanchor` entries are laid out per joint (njnt).
-    const mjtNum* knee_anchor_ptr = data->xanchor + 3 * knee_joint;
-    const mjtNum* hip_anchor_ptr = data->xanchor + 3 * hip_joint;
+        double plane_vec1[3];  // knee -> hip
+        double plane_vec2[3];  // knee -> contact
+        mju_sub3(plane_vec1, plane.hip_anchor, plane.knee_anchor);
+        mju_sub3(plane_vec2, plane.foot_point, plane.knee_anchor);
+        double vec1_norm = mju_norm3(plane_vec1);
+        double vec2_norm = mju_norm3(plane_vec2);
+        if (vec1_norm < kPlaneProjectionEps || vec2_norm < kPlaneProjectionEps) {
+          return;
+        }
 
-    double knee_anchor[3];
-    double hip_anchor[3];
-    mju_copy3(knee_anchor, knee_anchor_ptr);
-    mju_copy3(hip_anchor, hip_anchor_ptr);
+        double plane_u[3];
+        double plane_v[3];
+        mju_copy3(plane_u, plane_vec1);
+        mju_copy3(plane_v, plane_vec2);
+        mju_scl3(plane_u, plane_u, 1.0 / vec1_norm);
+        mju_scl3(plane_v, plane_v, 1.0 / vec2_norm);
 
-    double foot_point[3];
-    if (info.in_contact) {
-      mju_copy3(foot_point, info.point);
-    } else {
-      mju_copy3(foot_point, foot_pos[foot]);
-    }
+        double plane_normal_unit[3];
+        mju_copy3(plane_normal_unit, plane.plane_normal);
+        mju_normalize3(plane_normal_unit);
 
-  double plane_vec1[3];  // knee -> hip
-  double plane_vec2[3];  // knee -> contact
-    mju_sub3(plane_vec1, hip_anchor, knee_anchor);
-    mju_sub3(plane_vec2, foot_point, knee_anchor);
-    double plane_normal[3];
-    mju_cross(plane_normal, plane_vec1, plane_vec2);
-    if (mju_norm3(plane_normal) < kPlaneProjectionEps) {
-      return;
-    }
-    double vec1_norm = mju_norm3(plane_vec1);
-    double vec2_norm = mju_norm3(plane_vec2);
-    if (vec1_norm < kPlaneProjectionEps || vec2_norm < kPlaneProjectionEps) {
-      return;
-    }
+        mjtNum plane_center[3] = {
+            static_cast<mjtNum>((plane.foot_point[0] + plane.knee_anchor[0] +
+                                 plane.hip_anchor[0]) /
+                                3.0),
+            static_cast<mjtNum>((plane.foot_point[1] + plane.knee_anchor[1] +
+                                 plane.hip_anchor[1]) /
+                                3.0),
+            static_cast<mjtNum>((plane.foot_point[2] + plane.knee_anchor[2] +
+                                 plane.hip_anchor[2]) /
+                                3.0)};
+        mju_addToScl3(plane_center, plane_normal_unit, 0.001);
 
-    double plane_u[3];
-    double plane_v[3];
-    mju_copy3(plane_u, plane_vec1);
-    mju_copy3(plane_v, plane_vec2);
-    mju_scl3(plane_u, plane_u, 1.0 / vec1_norm);
-    mju_scl3(plane_v, plane_v, 1.0 / vec2_norm);
-    double plane_normal_unit[3];
-    mju_copy3(plane_normal_unit, plane_normal);
-    mju_normalize3(plane_normal_unit);
+        double size0 = vec1_norm;
+        double size1 = vec2_norm;
+        mjtNum plane_size[3] = {
+            static_cast<mjtNum>(mju_max(size0, 0.02)),
+            static_cast<mjtNum>(mju_max(size1, 0.02)),
+            0.001};
+        mjtNum plane_mat[9] = {
+            static_cast<mjtNum>(plane_u[0]),
+            static_cast<mjtNum>(plane_v[0]),
+            static_cast<mjtNum>(plane_normal_unit[0]),
+            static_cast<mjtNum>(plane_u[1]),
+            static_cast<mjtNum>(plane_v[1]),
+            static_cast<mjtNum>(plane_normal_unit[1]),
+            static_cast<mjtNum>(plane_u[2]),
+            static_cast<mjtNum>(plane_v[2]),
+            static_cast<mjtNum>(plane_normal_unit[2])};
 
-    mjtNum plane_center[3] = {
-        static_cast<mjtNum>((foot_point[0] + knee_anchor[0] + hip_anchor[0]) /
-                            3.0),
-        static_cast<mjtNum>((foot_point[1] + knee_anchor[1] + hip_anchor[1]) /
-                            3.0),
-        static_cast<mjtNum>((foot_point[2] + knee_anchor[2] + hip_anchor[2]) /
-                            3.0)};
-    mju_addToScl3(plane_center, plane_normal_unit, 0.001);
+        AddGeom(scene, mjGEOM_BOX, plane_size, plane_center, plane_mat,
+                kPlaneRgba);
 
-    double size0 = vec1_norm;
-    double size1 = vec2_norm;
-    mjtNum plane_size[3] = {
-        static_cast<mjtNum>(mju_max(size0, 0.02)),
-        static_cast<mjtNum>(mju_max(size1, 0.02)),
-        0.001};
-    mjtNum plane_mat[9] = {
-        static_cast<mjtNum>(plane_u[0]),
-        static_cast<mjtNum>(plane_v[0]),
-        static_cast<mjtNum>(plane_normal_unit[0]),
-        static_cast<mjtNum>(plane_u[1]),
-        static_cast<mjtNum>(plane_v[1]),
-        static_cast<mjtNum>(plane_normal_unit[1]),
-        static_cast<mjtNum>(plane_u[2]),
-        static_cast<mjtNum>(plane_v[2]),
-        static_cast<mjtNum>(plane_normal_unit[2])};
+        double point_size[3] = {0.025, 0.0, 0.0};
+        mjtNum hip_point[3] = {static_cast<mjtNum>(plane.hip_anchor[0]),
+                               static_cast<mjtNum>(plane.hip_anchor[1]),
+                               static_cast<mjtNum>(plane.hip_anchor[2])};
+        mjtNum knee_point[3] = {static_cast<mjtNum>(plane.knee_anchor[0]),
+                                static_cast<mjtNum>(plane.knee_anchor[1]),
+                                static_cast<mjtNum>(plane.knee_anchor[2])};
+        mjtNum contact_point[3] = {static_cast<mjtNum>(plane.foot_point[0]),
+                                   static_cast<mjtNum>(plane.foot_point[1]),
+                                   static_cast<mjtNum>(plane.foot_point[2])};
+        AddGeom(scene, mjGEOM_SPHERE, point_size, hip_point, /*mat=*/nullptr,
+                kPlanePointRgba[0]);
+        AddGeom(scene, mjGEOM_SPHERE, point_size, knee_point, /*mat=*/nullptr,
+                kPlanePointRgba[1]);
+        AddGeom(scene, mjGEOM_SPHERE, point_size, contact_point,
+                /*mat=*/nullptr, kPlanePointRgba[2]);
 
-    AddGeom(scene, mjGEOM_BOX, plane_size, plane_center, plane_mat,
-            kPlaneRgba);
+        double grf_proj[3];
+        ProjectOntoPlane(grf_proj, info.force, plane_normal_unit);
+        double grf_proj_norm = mju_norm3(grf_proj);
+        if (grf_proj_norm >= kPlaneProjectionEps) {
+          double grf_draw[3];
+          mju_copy3(grf_draw, grf_proj);
+          mju_scl3(grf_draw, grf_draw, kGrfVectorScale);
+          double grf_length = mju_norm3(grf_draw);
+          if (grf_length > kVectorMaxLength && grf_length > 0) {
+            mju_scl3(grf_draw, grf_draw, kVectorMaxLength / grf_length);
+          }
+          mjtNum from[3] = {plane.foot_point[0], plane.foot_point[1],
+                            plane.foot_point[2]};
+          mjtNum grf_to[3] = {plane.foot_point[0] + grf_draw[0],
+                              plane.foot_point[1] + grf_draw[1],
+                              plane.foot_point[2] + grf_draw[2]};
+          AddConnector(scene, mjGEOM_CAPSULE, kVectorWidth, from, grf_to,
+                       kGrfVectorRgba);
+        }
 
-    double point_size[3] = {0.025, 0.0, 0.0};
-    mjtNum hip_point[3] = {static_cast<mjtNum>(hip_anchor[0]),
-                           static_cast<mjtNum>(hip_anchor[1]),
-                           static_cast<mjtNum>(hip_anchor[2])};
-    mjtNum knee_point[3] = {static_cast<mjtNum>(knee_anchor[0]),
-                            static_cast<mjtNum>(knee_anchor[1]),
-                            static_cast<mjtNum>(knee_anchor[2])};
-    mjtNum contact_point[3] = {static_cast<mjtNum>(foot_point[0]),
-                               static_cast<mjtNum>(foot_point[1]),
-                               static_cast<mjtNum>(foot_point[2])};
-    AddGeom(scene, mjGEOM_SPHERE, point_size, hip_point, /*mat=*/nullptr,
-            kPlanePointRgba[0]);
-    AddGeom(scene, mjGEOM_SPHERE, point_size, knee_point, /*mat=*/nullptr,
-            kPlanePointRgba[1]);
-    AddGeom(scene, mjGEOM_SPHERE, point_size, contact_point, /*mat=*/nullptr,
-            kPlanePointRgba[2]);
+        double normal_proj[3] = {0.0, 0.0, 0.0};
+        bool normal_valid = false;
+        if (selection_ptr &&
+            mju_norm3(selection_ptr->normal_proj) >= kPlaneProjectionEps) {
+          mju_copy3(normal_proj, selection_ptr->normal_proj);
+          normal_valid = true;
+        } else if (mju_norm3(info.normal) >= kPlaneProjectionEps) {
+          ProjectOntoPlane(normal_proj, info.normal, plane_normal_unit);
+          if (mju_norm3(normal_proj) >= kPlaneProjectionEps) {
+            normal_valid = true;
+          }
+        }
+        if (normal_valid) {
+          double normal_draw[3];
+          mju_copy3(normal_draw, normal_proj);
+          mju_scl3(normal_draw, normal_draw, kGrfVectorScale);
+          double normal_length = mju_norm3(normal_draw);
+          if (normal_length > kVectorMaxLength && normal_length > 0) {
+            mju_scl3(normal_draw, normal_draw, kVectorMaxLength /
+                                              normal_length);
+          }
+          mjtNum normal_to[3] = {plane.foot_point[0] + normal_draw[0],
+                                 plane.foot_point[1] + normal_draw[1],
+                                 plane.foot_point[2] + normal_draw[2]};
+          mjtNum normal_from[3] = {plane.foot_point[0], plane.foot_point[1],
+                                   plane.foot_point[2]};
+          AddConnector(scene, mjGEOM_CAPSULE, kVectorWidth, normal_from,
+                       normal_to, kNormalVectorRgba);
+        }
 
-    if (!info.in_contact) {
-      return;
-    }
-
-  double grf_proj[3];
-  ProjectOntoPlane(grf_proj, info.force, plane_normal_unit);
-    double grf_proj_norm = mju_norm3(grf_proj);
-    if (grf_proj_norm < kPlaneProjectionEps) {
-      return;
-    }
-
-    double motor_vectors[2][3];
-    mju_sub3(motor_vectors[0], hip_anchor, foot_point);    // contact -> hip
-    mju_sub3(motor_vectors[1], knee_anchor, foot_point);   // contact -> knee
-
-  double contact_normal[3];
-  mju_copy3(contact_normal, info.normal);
-
-    MotorSelectionResult selection =
-        SelectMotorUsingNormal(contact_normal, motor_vectors,
-                               plane_normal_unit);
-    int best_candidate = selection.index;
-
-    double grf_draw[3];
-    mju_copy3(grf_draw, grf_proj);
-    mju_scl3(grf_draw, grf_draw, kGrfVectorScale);
-    double grf_length = mju_norm3(grf_draw);
-    if (grf_length > kVectorMaxLength && grf_length > 0) {
-      mju_scl3(grf_draw, grf_draw, kVectorMaxLength / grf_length);
-    }
-
-    mjtNum from[3] = {foot_point[0], foot_point[1], foot_point[2]};
-    mjtNum grf_to[3] = {foot_point[0] + grf_draw[0],
-                        foot_point[1] + grf_draw[1],
-                        foot_point[2] + grf_draw[2]};
-
-    AddConnector(scene, mjGEOM_CAPSULE, kVectorWidth, from, grf_to,
-                 kGrfVectorRgba);
-
-    double normal_proj_norm = mju_norm3(selection.normal_proj);
-    if (normal_proj_norm >= kPlaneProjectionEps) {
-      double normal_draw[3];
-      mju_copy3(normal_draw, selection.normal_proj);
-      mju_scl3(normal_draw, normal_draw, kGrfVectorScale);
-      double normal_length = mju_norm3(normal_draw);
-      if (normal_length > kVectorMaxLength && normal_length > 0) {
-        mju_scl3(normal_draw, normal_draw, kVectorMaxLength / normal_length);
-      }
-      mjtNum normal_to[3] = {foot_point[0] + normal_draw[0],
-                             foot_point[1] + normal_draw[1],
-                             foot_point[2] + normal_draw[2]};
-      AddConnector(scene, mjGEOM_CAPSULE, kVectorWidth, from, normal_to,
-                   kNormalVectorRgba);
-    }
-    if (best_candidate >= 0) {
-      const double* anchor_target = (best_candidate == 0) ? hip_anchor : knee_anchor;
-      mjtNum motor_from[3] = {static_cast<mjtNum>(foot_point[0]),
-                              static_cast<mjtNum>(foot_point[1]),
-                              static_cast<mjtNum>(foot_point[2])};
-      mjtNum motor_to[3] = {static_cast<mjtNum>(anchor_target[0]),
-                            static_cast<mjtNum>(anchor_target[1]),
-                            static_cast<mjtNum>(anchor_target[2])};
-      AddConnector(scene, mjGEOM_CAPSULE, kVectorWidth, motor_from, motor_to,
-                   kMotorVectorRgba);
-    }
-  };
+        if (reference_valid &&
+            mju_norm3(reference_vector) >= kPlaneProjectionEps) {
+          double ref_draw[3];
+          mju_copy3(ref_draw, reference_vector);
+          mju_scl3(ref_draw, ref_draw, kGrfVectorScale);
+          double ref_length = mju_norm3(ref_draw);
+          if (ref_length > kVectorMaxLength && ref_length > 0) {
+            mju_scl3(ref_draw, ref_draw, kVectorMaxLength / ref_length);
+          }
+          mjtNum ref_from[3] = {plane.foot_point[0], plane.foot_point[1],
+                                plane.foot_point[2]};
+          mjtNum ref_to[3] = {plane.foot_point[0] + ref_draw[0],
+                              plane.foot_point[1] + ref_draw[1],
+                              plane.foot_point[2] + ref_draw[2]};
+          AddConnector(scene, mjGEOM_CAPSULE, kVectorWidth, ref_from, ref_to,
+                       kMotorVectorRgba);
+        }
+      };
 
   for (int hind_idx = 0; hind_idx < 2; ++hind_idx) {
-    visualize_alignment_plane(ResidualFn::kFootHind[hind_idx]);
+    ResidualFn::A1Foot foot = ResidualFn::kFootHind[hind_idx];
+    const MotorSelectionResult* selection_ptr =
+        hind_selection_valid[hind_idx] ? &hind_selection_data[hind_idx]
+                                       : nullptr;
+    visualize_alignment_plane(foot, hind_reference_vectors[hind_idx],
+                              hind_reference_valid[hind_idx], selection_ptr);
+  }
+  for (int front_idx = 0; front_idx < 2; ++front_idx) {
+    ResidualFn::A1Foot foot = kFrontFeet[front_idx];
+    visualize_alignment_plane(foot, front_reference_vectors[front_idx],
+                              front_reference_valid[front_idx], nullptr);
   }
 }
 
