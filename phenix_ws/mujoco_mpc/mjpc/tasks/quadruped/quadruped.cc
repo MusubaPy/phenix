@@ -771,8 +771,30 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
   CheckSensorDim(model, counter);
 }
 
+// Helper function to print motor torques
+void PrintMotorTorques(const mjModel* model, const mjData* data) {
+  static double last_print_time = -1.0;
+  constexpr double kPrintInterval = 0.1; // Print every 0.1 seconds
+
+  if (last_print_time < 0.0 || data->time - last_print_time >= kPrintInterval) {
+    std::cout << "\n[Motor Torques] Time: " << std::fixed << std::setprecision(3) << data->time << " s\n";
+    std::cout << "--------------------------------------------------\n";
+    for (int i = 0; i < model->nu; ++i) {
+      const char* name = mj_id2name(model, mjOBJ_ACTUATOR, i);
+      double torque = data->actuator_force[i];
+      if (name) {
+        std::cout << std::left << std::setw(15) << name << ": " 
+                  << std::right << std::setw(8) << std::fixed << std::setprecision(3) << torque << " Nm\n";
+      }
+    }
+    std::cout << "--------------------------------------------------\n";
+    last_print_time = data->time;
+  }
+}
+
 //  ============  transition  ============
 void QuadrupedFlat::TransitionLocked(mjModel* model, mjData* data) {
+  PrintMotorTorques(model, data);
   // ---------- handle mjData reset ----------
   if (data->time < residual_.last_transition_time_ ||
       residual_.last_transition_time_ == -1) {
