@@ -38,6 +38,7 @@
 #include "mjpc/task.h"
 #include "mjpc/threadpool.h"
 #include "mjpc/utilities.h"
+#include "mjpc/tasks/quadruped/quadruped.h"
 
 ABSL_FLAG(bool, planner_enabled, true,
           "If true, the planner will run on startup");
@@ -86,11 +87,24 @@ void controller(const mjModel* m, mjData* data) {
   if (data != d) {
     return;
   }
+  // suppress or scale policy during the quadruped startup settle window
+  double startup_scale = 1.0;
+  if (auto* quad = dynamic_cast<mjpc::QuadrupedFlat*>(
+          sim->agent->ActiveTask())) {
+    startup_scale = quad->StartupCommandScale(data->time);
+    if (startup_scale <= 0.0) {
+      mju_zero(data->ctrl, m->nu);
+      return;
+    }
+  }
   // if simulation:
   if (sim->agent->action_enabled) {
     sim->agent->ActivePlanner().ActionFromPolicy(
         data->ctrl, &sim->agent->state.state()[0],
         sim->agent->state.time());
+  }
+  if (startup_scale < 1.0) {
+    mju_scl(data->ctrl, data->ctrl, startup_scale, m->nu);
   }
   // if noise
   if (!sim->agent->allocate_enabled && sim->uiloadrequest.load() == 0 &&
@@ -207,6 +221,7 @@ void EstimatorLoop(mj::Simulate& sim) {
 
 // simulate in background thread (while rendering in main thread)
 void PhysicsLoop(mj::Simulate& sim) {
+  constexpr double kMaxSimTimeSec = 60.0;
   // cpu-sim synchronization point
   std::chrono::time_point<mj::Simulate::Clock> syncCPU;
   mjtNum syncSim = 0;
@@ -359,6 +374,13 @@ void PhysicsLoop(mj::Simulate& sim) {
               if (d->time < prevSim) {
                 break;
               }
+
+              // terminate after max simulation time
+              if (d->time >= kMaxSimTimeSec) {
+                sim.run = 0;
+                sim.exitrequest.store(true);
+                break;
+              }
             }
           }
         } else {  // paused
@@ -381,6 +403,12 @@ void PhysicsLoop(mj::Simulate& sim) {
       if (!sim.agent->ActiveEstimatorIndex() || !sim.agent->estimator_enabled) {
         sim.agent->state.Set(m, d);
       }
+    }
+
+    // safety: stop if time exceeded while paused or after breaking out early
+    if (m && d && d->time >= kMaxSimTimeSec) {
+      sim.run = 0;
+      sim.exitrequest.store(true);
     }
   }
 }

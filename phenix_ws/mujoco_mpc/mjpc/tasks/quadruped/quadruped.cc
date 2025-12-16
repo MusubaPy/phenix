@@ -925,6 +925,13 @@ void QuadrupedFlat::TransitionLocked(mjModel* model, mjData* data) {
     if (mode != ResidualFn::kModeQuadruped && mode != ResidualFn::kModeBiped) {
       mode = ResidualFn::kModeQuadruped;  // mode stateful, switch to Quadruped
     }
+    // snap back to the crouch keyframe on (re)spawn so the robot begins prone
+    int crouch_id = mj_name2id(model, mjOBJ_KEY, "crouch");
+    if (crouch_id >= 0) {
+      mj_resetDataKeyframe(model, data, crouch_id);
+    }
+    mju_zero(data->qvel, model->nv);
+    mju_zero(data->ctrl, model->nu);
     residual_.last_transition_time_ = residual_.phase_start_time_ =
         residual_.phase_start_ = data->time;
 
@@ -985,7 +992,9 @@ void QuadrupedFlat::TransitionLocked(mjModel* model, mjData* data) {
         parameters[residual_.gait_param_id_] =
             ReinterpretAsDouble(ResidualFn::kGaitStand);
       }
-      mju_zero(data->ctrl, model->nu);
+      if (zero_torque_phase) {
+        mju_zero(data->ctrl, model->nu);
+      }
     } else {
       mode = ResidualFn::kModeWalk;
       residual_.startup_walk_triggered_ = true;
@@ -1167,6 +1176,31 @@ void QuadrupedFlat::TransitionLocked(mjModel* model, mjData* data) {
   // save mode
   residual_.current_mode_ = static_cast<ResidualFn::A1Mode>(mode);
   residual_.last_transition_time_ = data->time;
+}
+
+bool QuadrupedFlat::ShouldHoldStartup(double time) const {
+  double warmup_elapsed = time - residual_.warmup_start_time_;
+  return warmup_elapsed < residual_.warmup_zero_torque_time_;
+}
+
+double QuadrupedFlat::StartupCommandScale(double time) const {
+  double warmup_elapsed = time - residual_.warmup_start_time_;
+  if (warmup_elapsed <= 0.0) {
+    return 0.0;
+  }
+  if (warmup_elapsed < residual_.warmup_zero_torque_time_) {
+    return 0.0;
+  }
+  double ramp_start = residual_.warmup_zero_torque_time_;
+  double ramp_end = ramp_start + residual_.standup_ramp_duration_;
+  if (residual_.standup_ramp_duration_ <= 1e-6) {
+    return 1.0;
+  }
+  if (warmup_elapsed >= ramp_end) {
+    return 1.0;
+  }
+  double alpha = (warmup_elapsed - ramp_start) / residual_.standup_ramp_duration_;
+  return mju_clip(alpha, 0.0, 1.0);
 }
 
 // colors of visualisation elements drawn in ModifyScene()

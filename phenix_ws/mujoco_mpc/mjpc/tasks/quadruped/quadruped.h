@@ -225,7 +225,8 @@ class QuadrupedFlat : public Task {
     double gait_switch_time_  = 0;
 
     // warmup / measurement gating
-    double warmup_zero_torque_time_ = 5.0;   // seconds of zero torque hold
+    double warmup_zero_torque_time_ = 2.0;   // seconds of zero torque hold
+    double standup_ramp_duration_ = 2.5;     // seconds to ramp torques to full
     int warmup_skip_steps_ = 2000;           // steps to skip before measuring
     double warmup_start_time_ = 0.0;
     int warmup_step_counter_ = 0;
@@ -322,6 +323,12 @@ class QuadrupedFlat : public Task {
   // draw task-related geometry in the scene
   void ModifyScene(const mjModel* model, const mjData* data,
                    mjvScene* scene) const override;
+
+  // true when we want to suppress controller torques during startup settling
+  bool ShouldHoldStartup(double time) const;
+
+  // scale factor for controller commands during stand-up ramp
+  double StartupCommandScale(double time) const;
 
  protected:
   std::unique_ptr<mjpc::ResidualFn> ResidualLocked() const override {
