@@ -1,20 +1,61 @@
-# Build artifacts and generated files
+# Ignore build artifacts and generated files
+# Mujoco build outputs
 phenix_ws/mujoco_mpc/build/
+phenix_ws/mujoco_mpc/build/**
 phenix_ws/mujoco_mpc/.ninja*
 phenix_ws/mujoco_mpc/CMakeFiles/
 phenix_ws/mujoco_mpc/CMakeCache.txt
 phenix_ws/mujoco_mpc/cmake_install.cmake
+phenix_ws/mujoco_mpc/compile_commands.json
+phenix_ws/mujoco_mpc/ccd-targets.cmake
+phenix_ws/mujoco_mpc/MUJOCO_LOG.TXT
+phenix_ws/mujoco_mpc/logs/
+phenix_ws/mujoco_mpc/logs/**
+phenix_ws/mujoco_mpc/lib/
+phenix_ws/mujoco_mpc/lib/**
+phenix_ws/mujoco_mpc/bin/
 phenix_ws/mujoco_mpc/*.ninja*
 phenix_ws/mujoco_mpc/_deps/*-build/
 phenix_ws/mujoco_mpc/_deps/*-subbuild/
 phenix_ws/mujoco_mpc/_deps/*-populate*/
 phenix_ws/mujoco_mpc/_deps/*/build/
-# General patterns
+phenix_ws/mujoco_mpc/_deps/*/CMakeFiles/
+phenix_ws/mujoco_mpc/lib/pkgconfig/
+
+# General build/IDE/temp files
+**/build/
 **/CMakeFiles/
 **/CMakeCache.txt
 **/*.ninja*
-build/
-bin/
+**/compile_commands.json
+**/bin/
+**/lib/
+**/logs/
 *.o
 *.so
 *.a
+*.dSYM
+*.gcda
+*.gcno
+*.profdata
+*.profraw
+*.pyc
+__pycache__/
+.DS_Store
+*.swo
+*.swp
+*.log
+.idea/
+.vscode/
+*.iml
+
+# Ignore user/local generated files
+**/.cache/
+*.local
+
+# Ignore temporary and backup files
+*~
+*.tmp
+
+# Keep source directories (e.g. *_src) tracked; do not ignore them
+# (Explicitly not ignoring phenix_ws/mujoco_mpc/_deps/*-src)
