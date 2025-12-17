@@ -412,6 +412,15 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
   double* goal_pos = data->mocap_pos + 3*goal_mocap_id_;
   double* compos = SensorByName(model, data, "torso_subtreecom");
 
+  // If a GRF weight parameter is present in the XML, apply it as the default
+  if (residual_.grf_weight_param_id_ >= 0) {
+    double v = parameters_[residual_.grf_weight_param_id_];
+    if (v >= 0.0 && v != residual_.grf_weight_default_) {
+      residual_.grf_weight_default_ = v;
+      std::cout << "[Quadruped] residual_GRF_weight param applied: " << v << "\n";
+    }
+  }
+
 
   // ---------- Upright ----------
   if (current_mode_ != kModeFlip) {
@@ -2002,6 +2011,16 @@ void QuadrupedFlat::ResetLocked(const mjModel* model) {
     residual_.grf_weight_default_ = weight[residual_.grf_cost_id_];
   }
 
+  // Allow overriding GRF cost weight from environment for parameter sweeps.
+  if (const char* env = std::getenv("MJPC_GRF_WEIGHT")) {
+    double v = std::atof(env);
+    // Only accept non-negative values
+    if (v >= 0.0) {
+      residual_.grf_weight_default_ = v;
+      std::cout << "[Quadruped] MJPC_GRF_WEIGHT override: " << v << "\n";
+    }
+  }
+
   // ----------  model identifiers  ----------
   residual_.torso_body_id_ = mj_name2id(model, mjOBJ_XBODY, "trunk");
   if (residual_.torso_body_id_ < 0) mju_error("body 'trunk' not found");
@@ -2034,6 +2053,7 @@ void QuadrupedFlat::ResetLocked(const mjModel* model) {
   }
 
   residual_.debug_grf_param_id_ = ParameterIndex(model, "Debug GRF log");
+  residual_.grf_weight_param_id_ = ParameterIndex(model, "residual_GRF_weight");
   residual_.hind_grf_align_sensor_id_ =
       mj_name2id(model, mjOBJ_SENSOR, "Hind GRF Align");
   {

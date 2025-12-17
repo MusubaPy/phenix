@@ -267,6 +267,7 @@ class QuadrupedFlat : public Task {
     int hip_joint_id_[kNumFoot] = {-1, -1, -1, -1};
     int knee_joint_id_[kNumFoot] = {-1, -1, -1, -1};
     int debug_grf_param_id_   = -1;
+    int grf_weight_param_id_  = -1;  // optional param in XML to set default GRF weight
     int hind_grf_align_sensor_id_ = -1;
 
     // Contact/target smoothing state for GRF alignment.
