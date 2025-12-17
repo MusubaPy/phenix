@@ -26,6 +26,12 @@
 ABSL_FLAG(std::string, task, "Quadruped Flat",
           "Which model to load on startup.");
 
+ABSL_FLAG(double, max_sim_time, 60.0,
+          "Maximum simulation time in seconds before mjpc exits.");
+
+ABSL_FLAG(double, internal_grf_align_weight, 1e-3,
+          "Internal Kuznetsov GRF alignment residual weight (per-foot scale). Set to 0 to disable.");
+
 // machinery for replacing command line error by a macOS dialog box
 // when running under Rosetta
 #if defined(__APPLE__) && defined(__AVX__)

@@ -135,7 +135,7 @@ class QuadrupedFlat : public Task {
       0.02,  // walk
       0.02,  // trot
       0.6,   // canter
-      2,     // gallop
+      1e6,   // gallop (set very high to effectively disable automatic switch to gallop)
     };
     // notes:
     // - walk is never triggered by auto-gait
@@ -148,7 +148,7 @@ class QuadrupedFlat : public Task {
     constexpr static double kAutoGaitMinTime = 1;     // second
 
     // target torso height over feet when quadrupedal
-    constexpr static double kHeightQuadruped = 0.25;  // meter
+    constexpr static double kHeightQuadruped = 0.255;  // meter
 
     // target torso height over feet when bipedal
     constexpr static double kHeightBiped = 0.6;       // meter
@@ -225,8 +225,7 @@ class QuadrupedFlat : public Task {
     double gait_switch_time_  = 0;
 
     // warmup / measurement gating
-    double warmup_zero_torque_time_ = 2.0;   // seconds of zero torque hold
-    double standup_ramp_duration_ = 2.5;     // seconds to ramp torques to full
+    double warmup_zero_torque_time_ = 1.0;   // seconds of zero torque hold
     int warmup_skip_steps_ = 2000;           // steps to skip before measuring
     double warmup_start_time_ = 0.0;
     int warmup_step_counter_ = 0;
@@ -235,9 +234,15 @@ class QuadrupedFlat : public Task {
     bool measurement_active_prev_ = false;
 
     // startup hold then auto-walk
-    double startup_hold_duration_ = 5.0;  // stand still duration
+    double startup_hold_duration_ = 6.0;  // stand still duration
     double startup_begin_time_ = 0.0;
     bool startup_walk_triggered_ = false;
+    double startup_walk_time_ = 0.0;      // when we switched to walk
+    double startup_auto_delay_ = 0.5;     // delay before reenabling auto gait
+    double startup_ramp_duration_ = 2.0;  // seconds to ramp desired height
+    double startup_height_scale_ = 0.0;   // 0..1 multiplier for height goal
+    double startup_height_start_ = 0.0;   // CoM height at ramp start
+    bool startup_height_captured_ = false;
 
     //  ============  constants, computed in Reset()  ============
     int torso_body_id_        = -1;
@@ -263,6 +268,15 @@ class QuadrupedFlat : public Task {
     int knee_joint_id_[kNumFoot] = {-1, -1, -1, -1};
     int debug_grf_param_id_   = -1;
     int hind_grf_align_sensor_id_ = -1;
+
+    // Contact/target smoothing state for GRF alignment.
+    mutable int contact_streak_[kNumFoot] = {0, 0, 0, 0};
+    mutable double filtered_target_proj_[kNumFoot][3] = {
+      {0.0, 0.0, 0.0},
+      {0.0, 0.0, 0.0},
+      {0.0, 0.0, 0.0},
+      {0.0, 0.0, 0.0}};
+    mutable double last_filter_time_ = -1.0;
 
     // derived kinematic quantities describing flip trajectory
     double gravity_           = 0;
@@ -326,9 +340,6 @@ class QuadrupedFlat : public Task {
 
   // true when we want to suppress controller torques during startup settling
   bool ShouldHoldStartup(double time) const;
-
-  // scale factor for controller commands during stand-up ramp
-  double StartupCommandScale(double time) const;
 
  protected:
   std::unique_ptr<mjpc::ResidualFn> ResidualLocked() const override {

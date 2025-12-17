@@ -1,0 +1,20 @@
+# Build artifacts and generated files
+phenix_ws/mujoco_mpc/build/
+phenix_ws/mujoco_mpc/.ninja*
+phenix_ws/mujoco_mpc/CMakeFiles/
+phenix_ws/mujoco_mpc/CMakeCache.txt
+phenix_ws/mujoco_mpc/cmake_install.cmake
+phenix_ws/mujoco_mpc/*.ninja*
+phenix_ws/mujoco_mpc/_deps/*-build/
+phenix_ws/mujoco_mpc/_deps/*-subbuild/
+phenix_ws/mujoco_mpc/_deps/*-populate*/
+phenix_ws/mujoco_mpc/_deps/*/build/
+# General patterns
+**/CMakeFiles/
+**/CMakeCache.txt
+**/*.ninja*
+build/
+bin/
+*.o
+*.so
+*.a

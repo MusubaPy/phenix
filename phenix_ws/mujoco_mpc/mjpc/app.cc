@@ -13,6 +13,10 @@
 // limitations under the License.
 
 #include "mjpc/app.h"
+#include <absl/flags/flag.h>
+#include <absl/flags/declare.h>
+
+ABSL_DECLARE_FLAG(double, max_sim_time);
 
 #include <algorithm>
 #include <atomic>
@@ -87,12 +91,10 @@ void controller(const mjModel* m, mjData* data) {
   if (data != d) {
     return;
   }
-  // suppress or scale policy during the quadruped startup settle window
-  double startup_scale = 1.0;
+  // suppress policy during the quadruped startup settle window
   if (auto* quad = dynamic_cast<mjpc::QuadrupedFlat*>(
           sim->agent->ActiveTask())) {
-    startup_scale = quad->StartupCommandScale(data->time);
-    if (startup_scale <= 0.0) {
+    if (quad->ShouldHoldStartup(data->time)) {
       mju_zero(data->ctrl, m->nu);
       return;
     }
@@ -102,9 +104,6 @@ void controller(const mjModel* m, mjData* data) {
     sim->agent->ActivePlanner().ActionFromPolicy(
         data->ctrl, &sim->agent->state.state()[0],
         sim->agent->state.time());
-  }
-  if (startup_scale < 1.0) {
-    mju_scl(data->ctrl, data->ctrl, startup_scale, m->nu);
   }
   // if noise
   if (!sim->agent->allocate_enabled && sim->uiloadrequest.load() == 0 &&
@@ -221,7 +220,16 @@ void EstimatorLoop(mj::Simulate& sim) {
 
 // simulate in background thread (while rendering in main thread)
 void PhysicsLoop(mj::Simulate& sim) {
-  constexpr double kMaxSimTimeSec = 60.0;
+  // Allow user to override the hard stop time via environment variable
+  // `MJPC_MAX_SIM_TIME` (fallback default 60.0 seconds).
+  double kMaxSimTimeSec = 60.0;
+  if (const char* env = std::getenv("MJPC_MAX_SIM_TIME")) {
+    try {
+      kMaxSimTimeSec = std::stod(std::string(env));
+    } catch (...) {
+      // fall back to default
+    }
+  }
   // cpu-sim synchronization point
   std::chrono::time_point<mj::Simulate::Clock> syncCPU;
   mjtNum syncSim = 0;
