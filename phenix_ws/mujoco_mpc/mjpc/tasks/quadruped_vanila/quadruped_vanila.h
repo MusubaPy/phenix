@@ -16,26 +16,10 @@
 #define MJPC_TASKS_QUADRUPED_QUADRUPED_H_
 
 #include <string>
-#include <fstream>
 #include <mujoco/mujoco.h>
 #include "mjpc/task.h"
 
 namespace mjpc {
-// Foot contact information used by the residual and logging utilities.
-struct FootContactInfo {
-  FootContactInfo() {
-    mju_zero3(force);
-    mju_zero3(normal);
-    mju_zero3(point);
-    weight = 0.0;
-    in_contact = false;
-  }
-  double force[3];
-  double normal[3];
-  double point[3];
-  double weight;
-  bool in_contact;
-};
 
 class QuadrupedFlat : public Task {
  public:
@@ -44,9 +28,7 @@ class QuadrupedFlat : public Task {
   class ResidualFn : public mjpc::BaseResidualFn {
    public:
     explicit ResidualFn(const QuadrupedFlat* task)
-      : mjpc::BaseResidualFn(task),
-        debug_log_state_(std::make_shared<DebugLogState>()),
-        csv_log_state_(std::make_shared<CsvLogState>()) {}
+        : mjpc::BaseResidualFn(task) {}
     ResidualFn(const ResidualFn&) = default;
     void Residual(const mjModel* model, const mjData* data,
                   double* residual) const override;
@@ -90,14 +72,6 @@ class QuadrupedFlat : public Task {
     constexpr static A1Gait kGaitAll[kNumGait] = {kGaitStand, kGaitWalk,
                                                   kGaitTrot, kGaitCanter,
                                                   kGaitGallop};
-    constexpr static A1Foot kFootFront[2] = {kFootFL, kFootFR};
-    constexpr static const char* kAbductionJointNames[kNumFoot] = {
-      "FL_hip_joint", "RL_hip_joint", "FR_hip_joint", "RR_hip_joint"};
-    constexpr static const char* kHipJointNames[kNumFoot] = {
-      "FL_thigh_joint", "RL_thigh_joint", "FR_thigh_joint",
-      "RR_thigh_joint"};
-    constexpr static const char* kKneeJointNames[kNumFoot] = {
-      "FL_calf_joint", "RL_calf_joint", "FR_calf_joint", "RR_calf_joint"};
 
     // gait phase signature (normalized)
     constexpr static double kGaitPhase[kNumGait][kNumFoot] =
@@ -217,25 +191,6 @@ class QuadrupedFlat : public Task {
     double phase_velocity_    = 0;
     double com_vel_[2]        = {0};
     double gait_switch_time_  = 0;
-    // warmup / measurement gating
-    double warmup_zero_torque_time_ = 1.0;   // seconds of zero torque hold
-    int warmup_skip_steps_ = 2000;           // steps to skip before measuring
-    double warmup_start_time_ = 0.0;
-    int warmup_step_counter_ = 0;
-    bool warmup_initialized_ = false;
-    bool measurement_active_ = false;
-    bool measurement_active_prev_ = false;
-
-    // startup hold then auto-walk
-    double startup_hold_duration_ = 6.0;  // stand still duration
-    double startup_begin_time_ = 0.0;
-    bool startup_walk_triggered_ = false;
-    double startup_walk_time_ = 0.0;      // when we switched to walk
-    double startup_auto_delay_ = 0.5;     // delay before reenabling auto gait
-    double startup_ramp_duration_ = 2.0;  // seconds to ramp desired height
-    double startup_height_scale_ = 0.0;   // 0..1 multiplier for height goal
-    double startup_height_start_ = 0.0;   // CoM height at ramp start
-    bool startup_height_captured_ = false;
 
     //  ============  constants, computed in Reset()  ============
     int torso_body_id_        = -1;
@@ -252,15 +207,8 @@ class QuadrupedFlat : public Task {
     int upright_cost_id_      = -1;
     int balance_cost_id_      = -1;
     int height_cost_id_       = -1;
-    int grf_cost_id_          = -1;
-    double grf_weight_default_ = 0.0;
     int foot_geom_id_[kNumFoot];
     int shoulder_body_id_[kNumFoot];
-    int abduction_joint_id_[kNumFoot] = {-1, -1, -1, -1};
-    int hip_joint_id_[kNumFoot] = {-1, -1, -1, -1};
-    int knee_joint_id_[kNumFoot] = {-1, -1, -1, -1};
-    int debug_grf_param_id_   = -1;
-    int hind_grf_align_sensor_id_ = -1;
 
     // derived kinematic quantities describing flip trajectory
     double gravity_           = 0;
@@ -277,54 +225,9 @@ class QuadrupedFlat : public Task {
     double jump_rot_vel_      = 0;
     double jump_rot_acc_      = 0;
     double land_rot_acc_      = 0;
-    double total_mass_        = 0;
-
-    // Contact/target smoothing state for GRF alignment.
-    mutable int contact_streak_[kNumFoot] = {0, 0, 0, 0};
-    mutable double filtered_target_proj_[kNumFoot][3] = {
-      {0.0, 0.0, 0.0},
-      {0.0, 0.0, 0.0},
-      {0.0, 0.0, 0.0},
-      {0.0, 0.0, 0.0}};
-    mutable double last_filter_time_ = -1.0;
-
-    // debug logging state shared across residual copies
-    struct DebugLogState {
-      std::mutex state_mutex;
-      bool header_printed = false;
-      int print_count = 0;
-      double last_print_time = -std::numeric_limits<double>::infinity();
-      double next_print_time = -std::numeric_limits<double>::infinity();
-    };
-
-    // CSV logging state shared across residual copies
-    struct CsvLogState {
-      std::mutex state_mutex;
-      bool stream_ready = false;
-      bool header_written = false;
-      double last_time = -std::numeric_limits<double>::infinity();
-      double energy_abs = 0.0;
-      double energy_signed = 0.0;
-      int energy_reset_count = 0;
-      std::string path = "logs/quadruped_log.csv";
-      std::vector<int> actuator_joint_ids;
-      std::ofstream stream;
-    };
-
-    void MaybeLogStep(const mjModel* model, const mjData* data,
-                      const FootContactInfo* contact_info,
-                      const double* net_grf,
-                      bool measurement_active) const;
-
-    mutable std::shared_ptr<DebugLogState> debug_log_state_;
-    mutable std::shared_ptr<CsvLogState> csv_log_state_ =
-        std::make_shared<CsvLogState>();
   };
 
   QuadrupedFlat() : residual_(this) {}
-  // Whether the task wants the policy to be suppressed during the startup
-  // settle window. Implemented in the CC file.
-  bool ShouldHoldStartup(double time) const;
   void TransitionLocked(mjModel* model, mjData* data) override;
 
   // call base-class Reset, save task-related ids

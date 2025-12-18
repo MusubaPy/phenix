@@ -43,6 +43,12 @@ ABSL_DECLARE_FLAG(double, max_sim_time);
 #include "mjpc/threadpool.h"
 #include "mjpc/utilities.h"
 #include "mjpc/tasks/quadruped_vanila/quadruped_vanila.h"
+// include mod header as well (we keep both in source tree)
+#include "mjpc/tasks/quadruped_mod/quadruped_mod.h"
+
+// Returns true when controller torques should be suppressed during startup
+// settling for quadruped tasks. Implemented below, after `sim` is declared,
+// so it can safely access the global simulate object.
 
 ABSL_FLAG(bool, planner_enabled, true,
           "If true, the planner will run on startup");
@@ -80,6 +86,22 @@ using Seconds = std::chrono::duration<double>;
 // --------------------------------- callbacks ---------------------------------
 std::unique_ptr<mj::Simulate> sim;
 
+namespace {
+bool TaskShouldHoldStartup(double time) {
+  // If sim is not available, be conservative and don't hold
+  if (!sim) return false;
+
+  // Use the current task's XML filename to detect quadruped tasks (both
+  // vanilla and mod models include 'quadruped' in their path).
+  std::string xml = sim->agent->GetTaskXmlPath(sim->agent->gui_task_id);
+  if (xml.find("quadruped") == std::string::npos) return false;
+
+  // conservative default matching quadruped_mod's default of 1.0s
+  constexpr double kDefaultWarmupZeroTorqueTime = 1.0;
+  return time < kDefaultWarmupZeroTorqueTime;
+}
+}  // namespace
+
 // controller
 extern "C" {
 void controller(const mjModel* m, mjData* d);
@@ -92,12 +114,9 @@ void controller(const mjModel* m, mjData* data) {
     return;
   }
   // suppress policy during the quadruped startup settle window
-  if (auto* quad = dynamic_cast<mjpc::QuadrupedFlat*>(
-          sim->agent->ActiveTask())) {
-    if (quad->ShouldHoldStartup(data->time)) {
-      mju_zero(data->ctrl, m->nu);
-      return;
-    }
+  if (TaskShouldHoldStartup(data->time)) {
+    mju_zero(data->ctrl, m->nu);
+    return;
   }
   // if simulation:
   if (sim->agent->action_enabled) {
@@ -443,7 +462,7 @@ MjpcApp::MjpcApp(std::vector<std::shared_ptr<mjpc::Task>> tasks, int task_id) {
     mju_error("Multiple instances of MjpcApp created.");
     return;
   }
-  sim = std::make_unique<mj::Simulate>(
+    sim = std::make_unique<mj::Simulate>(
       std::make_unique<mujoco::GlfwAdapter>(),
       std::make_shared<Agent>());
 
@@ -452,7 +471,10 @@ MjpcApp::MjpcApp(std::vector<std::shared_ptr<mjpc::Task>> tasks, int task_id) {
 
   sim->filename = sim->agent->GetTaskXmlPath(sim->agent->gui_task_id);
   m = LoadModel(sim->agent.get(), *sim);
-  if (m) d = mj_makeData(m);
+  if (m) {
+    d = mj_makeData(m);
+    (void)d;
+  }
 
   // set home keyframe
   int home_id = mj_name2id(m, mjOBJ_KEY, "home");

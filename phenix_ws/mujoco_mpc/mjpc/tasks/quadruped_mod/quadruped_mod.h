@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef MJPC_TASKS_QUADRUPED_QUADRUPED_H_
-#define MJPC_TASKS_QUADRUPED_QUADRUPED_H_
+#ifndef MJPC_TASKS_QUADRUPED_MOD_QUADRUPED_H_
+#define MJPC_TASKS_QUADRUPED_MOD_QUADRUPED_H_
 
 #include <fstream>
 #include <limits>
@@ -43,13 +43,13 @@ struct FootContactInfo {
   bool in_contact;
 };
 
-class QuadrupedFlat : public Task {
+class QuadrupedFlatMod : public Task {
  public:
   std::string Name() const override;
   std::string XmlPath() const override;
   class ResidualFn : public mjpc::BaseResidualFn {
    public:
-  explicit ResidualFn(const QuadrupedFlat* task)
+  explicit ResidualFn(const QuadrupedFlatMod* task)
     : mjpc::BaseResidualFn(task),
       debug_log_state_(std::make_shared<DebugLogState>()),
       csv_log_state_(std::make_shared<CsvLogState>()) {}
@@ -58,7 +58,7 @@ class QuadrupedFlat : public Task {
                   double* residual) const override;
 
    private:
-    friend class QuadrupedFlat;
+    friend class QuadrupedFlatMod;
     //  ============  enums  ============
     // modes
     enum A1Mode {
@@ -328,7 +328,7 @@ class QuadrupedFlat : public Task {
         std::make_shared<CsvLogState>();
   };
 
-  QuadrupedFlat() : residual_(this) {}
+  QuadrupedFlatMod() : residual_(this) {}
   void TransitionLocked(mjModel* model, mjData* data) override;
 
   // call base-class Reset, save task-related ids
@@ -341,6 +341,9 @@ class QuadrupedFlat : public Task {
   // true when we want to suppress controller torques during startup settling
   bool ShouldHoldStartup(double time) const;
 
+  // Note: startup hold is handled centrally in `app.cc` to behave the same
+  // for both vanilla and modified quadruped tasks.
+
  protected:
   std::unique_ptr<mjpc::ResidualFn> ResidualLocked() const override {
     return std::make_unique<ResidualFn>(residual_);
@@ -352,15 +355,14 @@ class QuadrupedFlat : public Task {
   ResidualFn residual_;
 };
 
-
-class QuadrupedHill : public Task {
+class QuadrupedHillMod : public Task {
  public:
   std::string Name() const override;
   std::string XmlPath() const override;
   class ResidualFn : public mjpc::BaseResidualFn {
    public:
-    explicit ResidualFn(const QuadrupedHill* task, int current_mode = 0)
-        : mjpc::BaseResidualFn(task), current_mode_(current_mode) {}
+    explicit ResidualFn(const QuadrupedHillMod* task, int current_mode = 0)
+      : mjpc::BaseResidualFn(task), current_mode_(current_mode) {}
 
     // --------------------- Residuals for quadruped task --------------------
     //   Number of residuals: 4
@@ -373,11 +375,11 @@ class QuadrupedHill : public Task {
     // -----------------------------------------------------------------------
     void Residual(const mjModel* model, const mjData* data,
                   double* residual) const override;
-   private:
-    friend class QuadrupedHill;
+  private:
+   friend class QuadrupedHillMod;
     int current_mode_;
   };
-  QuadrupedHill() : residual_(this) {}
+  QuadrupedHillMod() : residual_(this) {}
   void TransitionLocked(mjModel* model, mjData* data) override;
 
  protected:
@@ -392,4 +394,4 @@ class QuadrupedHill : public Task {
 
 }  // namespace mjpc
 
-#endif  // MJPC_TASKS_QUADRUPED_QUADRUPED_H_
+#endif  // MJPC_TASKS_QUADRUPED_MOD_QUADRUPED_H_

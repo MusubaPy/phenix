@@ -38,9 +38,9 @@ add_library(
   tasks/tasks.cc
   tasks/tasks.h
   tasks/quadruped_mod/quadruped_mod.cc
+  tasks/quadruped_vanila/quadruped_vanila.cc
   tasks/quadruped_mod/quadruped_mod.h
   tasks/quadruped_vanila/quadruped_vanila.cc
-  tasks/quadruped_vanila/quadruped_vanila.h
   planners/planner.cc
   planners/planner.h
   planners/policy.h
@@ -276,6 +276,7 @@ add_library(
   tasks/tasks.cc
   tasks/tasks.h
   tasks/quadruped_mod/quadruped_mod.cc
+  tasks/quadruped_vanila/quadruped_vanila.cc
   planners/planner.cc
   planners/planner.h
   planners/policy.h
@@ -378,6 +379,10 @@ target_link_libraries(
   mujoco::mujoco
   threadpool
   Threads::Threads
+)
+target_link_libraries(
+  mjpc_mod
+  libmjpc_vanila
 )
 target_include_directories(mjpc_mod PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_compile_options(mjpc_mod PUBLIC ${MJPC_COMPILE_OPTIONS})

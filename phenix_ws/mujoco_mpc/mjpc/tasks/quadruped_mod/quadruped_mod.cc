@@ -251,7 +251,7 @@ bool ComputePlaneData(const mjData* data, const double* foot_pos,
 
 namespace mjpc {
 
-void QuadrupedFlat::ResidualFn::MaybeLogStep(
+void QuadrupedFlatMod::ResidualFn::MaybeLogStep(
     const mjModel* model, const mjData* data,
     const FootContactInfo* contact_info, const double* net_grf,
     bool measurement_active) const {
@@ -377,18 +377,18 @@ void QuadrupedFlat::ResidualFn::MaybeLogStep(
   state->last_time = t;
 }
 
-std::string QuadrupedHill::XmlPath() const {
+std::string QuadrupedHillMod::XmlPath() const {
   return GetModelPath("quadruped_mod/task_hill_mod.xml");
 }
-std::string QuadrupedFlat::XmlPath() const {
+std::string QuadrupedFlatMod::XmlPath() const {
   return GetModelPath("quadruped_mod/task_flat_mod.xml");
 }
-std::string QuadrupedHill::Name() const { return "Quadruped Hill"; }
-std::string QuadrupedFlat::Name() const { return "Quadruped Flat"; }
+std::string QuadrupedHillMod::Name() const { return "Quadruped Hill"; }
+std::string QuadrupedFlatMod::Name() const { return "Quadruped Flat"; }
 
-void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
-                                         const mjData* data,
-                                         double* residual) const {
+void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
+                                            const mjData* data,
+                                            double* residual) const {
   // start counter
   int counter = 0;
 
@@ -1061,7 +1061,7 @@ void PrintMotorTorques(const mjModel* model, const mjData* data) {
 }
 
 //  ============  transition  ============
-void QuadrupedFlat::TransitionLocked(mjModel* model, mjData* data) {
+void QuadrupedFlatMod::TransitionLocked(mjModel* model, mjData* data) {
   PrintMotorTorques(model, data);
   // ---------- handle mjData reset ----------
   if (data->time < residual_.last_transition_time_ ||
@@ -1363,10 +1363,13 @@ void QuadrupedFlat::TransitionLocked(mjModel* model, mjData* data) {
   residual_.last_transition_time_ = data->time;
 }
 
-bool QuadrupedFlat::ShouldHoldStartup(double time) const {
+bool QuadrupedFlatMod::ShouldHoldStartup(double time) const {
   double warmup_elapsed = time - residual_.warmup_start_time_;
   return warmup_elapsed < residual_.warmup_zero_torque_time_;
 }
+
+// Startup hold was moved to app.cc's TaskShouldHoldStartup helper so the
+// behavior is consistent for both vanilla and modified quadruped tasks.
 
 // colors of visualisation elements drawn in ModifyScene()
 constexpr float kStepRgba[4] = {0.6, 0.8, 0.2, 1};  // step-height cylinders
@@ -1389,8 +1392,8 @@ constexpr double kVectorMaxLength = 0.3;                            // max vecto
 constexpr double kVectorWidth = 0.01;                              // vector thickness
 
 // draw task-related geometry in the scene
-void QuadrupedFlat::ModifyScene(const mjModel* model, const mjData* data,
-                           mjvScene* scene) const {
+void QuadrupedFlatMod::ModifyScene(const mjModel* model, const mjData* data,
+                                   mjvScene* scene) const {
   // flip target pose
   if (residual_.current_mode_ == ResidualFn::kModeFlip) {
     double flip_time = data->time - residual_.mode_start_time_;
@@ -1945,9 +1948,11 @@ void QuadrupedFlat::ModifyScene(const mjModel* model, const mjData* data,
 
 //  ============  task-state utilities  ============
 // save task-related ids
-void QuadrupedFlat::ResetLocked(const mjModel* model) {
+void QuadrupedFlatMod::ResetLocked(const mjModel* model) {
+  (void)model;
   // ----------  task identifiers  ----------
   residual_.gait_param_id_ = ParameterIndex(model, "select_Gait");
+  (void)residual_.gait_param_id_;
   residual_.gait_switch_param_id_ = ParameterIndex(model, "select_Gait switch");
   residual_.flip_dir_param_id_ = ParameterIndex(model, "select_Flip dir");
   residual_.biped_type_param_id_ = ParameterIndex(model, "select_Biped type");
@@ -1966,9 +1971,11 @@ void QuadrupedFlat::ResetLocked(const mjModel* model) {
 
   // ----------  model identifiers  ----------
   residual_.torso_body_id_ = mj_name2id(model, mjOBJ_XBODY, "trunk");
+  (void)residual_.torso_body_id_;
   if (residual_.torso_body_id_ < 0) mju_error("body 'trunk' not found");
 
   residual_.head_site_id_ = mj_name2id(model, mjOBJ_SITE, "head");
+  (void)residual_.head_site_id_;
   if (residual_.head_site_id_ < 0) mju_error("site 'head' not found");
 
   int goal_id = mj_name2id(model, mjOBJ_XBODY, "goal");
@@ -1985,6 +1992,7 @@ void QuadrupedFlat::ResetLocked(const mjModel* model) {
     residual_.foot_geom_id_[foot_index] = foot_id;
     foot_index++;
   }
+  (void)residual_.foot_geom_id_;
 
   // shoulder body ids
   int shoulder_index = 0;
@@ -1994,10 +2002,13 @@ void QuadrupedFlat::ResetLocked(const mjModel* model) {
     residual_.shoulder_body_id_[shoulder_index] = foot_id;
     shoulder_index++;
   }
+  (void)residual_.shoulder_body_id_;
 
   residual_.debug_grf_param_id_ = ParameterIndex(model, "Debug GRF log");
+  (void)residual_.debug_grf_param_id_;
   residual_.hind_grf_align_sensor_id_ =
       mj_name2id(model, mjOBJ_SENSOR, "Hind GRF Align");
+  (void)residual_.hind_grf_align_sensor_id_;
   {
     auto state = residual_.debug_log_state_;
     std::lock_guard<std::mutex> state_lock(state->state_mutex);
@@ -2006,6 +2017,7 @@ void QuadrupedFlat::ResetLocked(const mjModel* model) {
     state->last_print_time = -std::numeric_limits<double>::infinity();
     state->next_print_time = -std::numeric_limits<double>::infinity();
   }
+  (void)0;
 
   for (int foot = 0; foot < ResidualFn::kNumFoot; ++foot) {
     const char* abduction_joint =
@@ -2028,11 +2040,13 @@ void QuadrupedFlat::ResetLocked(const mjModel* model) {
       mju_error_s("joint '%s' not found", knee_joint);
     }
   }
+  (void)0;
 
   residual_.total_mass_ = 0.0;
   for (int i = 0; i < model->nbody; ++i) {
     residual_.total_mass_ += model->body_mass[i];
   }
+  (void)residual_.total_mass_;
 
   // стартовый режим по умолчанию — Quadruped / Stand (статичная стойка)
   mode = ResidualFn::kModeQuadruped;
@@ -2045,24 +2059,31 @@ void QuadrupedFlat::ResetLocked(const mjModel* model) {
 
   // ----------  derived kinematic quantities for Flip  ----------
   residual_.gravity_ = mju_norm3(model->opt.gravity);
+    (void)residual_.gravity_;
   // velocity at takeoff
   residual_.jump_vel_ =
       mju_sqrt(2 * residual_.gravity_ *
                (ResidualFn::kMaxHeight - ResidualFn::kLeapHeight));
+    (void)residual_.jump_vel_;
   // time in flight phase
   residual_.flight_time_ = 2 * residual_.jump_vel_ / residual_.gravity_;
+    (void)residual_.flight_time_;
   // acceleration during jump phase
   residual_.jump_acc_ =
       residual_.jump_vel_ * residual_.jump_vel_ /
       (2 * (ResidualFn::kLeapHeight - ResidualFn::kCrouchHeight));
+    (void)residual_.jump_acc_;
   // time in crouch sub-phase of jump
   residual_.crouch_time_ =
       mju_sqrt(2 * (ResidualFn::kHeightQuadruped - ResidualFn::kCrouchHeight) /
                residual_.jump_acc_);
+    (void)residual_.crouch_time_;
   // time in leap sub-phase of jump
   residual_.leap_time_ = residual_.jump_vel_ / residual_.jump_acc_;
+    (void)residual_.leap_time_;
   // jump total time
   residual_.jump_time_ = residual_.crouch_time_ + residual_.leap_time_;
+    (void)residual_.jump_time_;
   // velocity at beginning of crouch
   residual_.crouch_vel_ = -residual_.jump_acc_ * residual_.crouch_time_;
   // time of landing phase
@@ -2087,7 +2108,7 @@ void QuadrupedFlat::ResetLocked(const mjModel* model) {
 }
 
 // compute average foot position, depending on mode
-void QuadrupedFlat::ResidualFn::AverageFootPos(
+void QuadrupedFlatMod::ResidualFn::AverageFootPos(
     double avg_foot_pos[3], double* foot_pos[kNumFoot]) const {
   if (current_mode_ == kModeBiped) {
     int handstand = ReinterpretAsInt(parameters_[biped_type_param_id_]);
@@ -2106,12 +2127,12 @@ void QuadrupedFlat::ResidualFn::AverageFootPos(
 }
 
 // return phase as a function of time
-double QuadrupedFlat::ResidualFn::GetPhase(double time) const {
+double QuadrupedFlatMod::ResidualFn::GetPhase(double time) const {
   return phase_start_ + (time - phase_start_time_) * phase_velocity_;
 }
 
 // horizontal Walk trajectory
-void QuadrupedFlat::ResidualFn::Walk(double pos[2], double time) const {
+void QuadrupedFlatMod::ResidualFn::Walk(double pos[2], double time) const {
   if (mju_abs(angvel_) < kMinAngvel) {
     // no rotation, go in straight line
     double forward[2] = {heading_[0], heading_[1]};
@@ -2130,14 +2151,14 @@ void QuadrupedFlat::ResidualFn::Walk(double pos[2], double time) const {
 }
 
 // get gait
-QuadrupedFlat::ResidualFn::A1Gait QuadrupedFlat::ResidualFn::GetGait() const {
+QuadrupedFlatMod::ResidualFn::A1Gait QuadrupedFlatMod::ResidualFn::GetGait() const {
   if (current_mode_ == kModeBiped)
     return kGaitTrot;
   return static_cast<A1Gait>(ReinterpretAsInt(current_gait_));
 }
 
 // return normalized target step height
-double QuadrupedFlat::ResidualFn::StepHeight(double time, double footphase,
+double QuadrupedFlatMod::ResidualFn::StepHeight(double time, double footphase,
                                              double duty_ratio) const {
   double angle = fmod(time + mjPI - footphase, 2*mjPI) - mjPI;
   double value = 0;
@@ -2149,8 +2170,8 @@ double QuadrupedFlat::ResidualFn::StepHeight(double time, double footphase,
 }
 
 // compute target step height for all feet
-void QuadrupedFlat::ResidualFn::FootStep(double step[kNumFoot], double time,
-                                         A1Gait gait) const {
+void QuadrupedFlatMod::ResidualFn::FootStep(double step[kNumFoot], double time,
+                                            A1Gait gait) const {
   double amplitude = parameters_[amplitude_param_id_];
   double duty_ratio = parameters_[duty_param_id_];
   for (A1Foot foot : kFootAll) {
@@ -2160,7 +2181,7 @@ void QuadrupedFlat::ResidualFn::FootStep(double step[kNumFoot], double time,
 }
 
 // height during flip
-double QuadrupedFlat::ResidualFn::FlipHeight(double time) const {
+double QuadrupedFlatMod::ResidualFn::FlipHeight(double time) const {
   if (time >= jump_time_ + flight_time_ + land_time_) {
     return kHeightQuadruped + ground_;
   }
@@ -2180,7 +2201,7 @@ double QuadrupedFlat::ResidualFn::FlipHeight(double time) const {
 // orientation during flip
 //  total rotation = leap + flight + land
 //            2*pi = pi/2 + 5*pi/4 + pi/4
-void QuadrupedFlat::ResidualFn::FlipQuat(double quat[4], double time) const {
+void QuadrupedFlatMod::ResidualFn::FlipQuat(double quat[4], double time) const {
   double angle = 0;
   if (time >= jump_time_ + flight_time_ + land_time_) {
     angle = 2*mjPI;
@@ -2210,9 +2231,9 @@ void QuadrupedFlat::ResidualFn::FlipQuat(double quat[4], double time) const {
 //   Number of parameters: 1
 //     Parameter (1): height_goal
 // -----------------------------------------------------------------------
-void QuadrupedHill::ResidualFn::Residual(const mjModel* model,
-                                         const mjData* data,
-                                         double* residual) const {
+void QuadrupedHillMod::ResidualFn::Residual(const mjModel* model,
+                                            const mjData* data,
+                                            double* residual) const {
   // ---------- Residual (0) ----------
   // standing height goal
   double height_goal = parameters_[0];
@@ -2260,7 +2281,7 @@ void QuadrupedHill::ResidualFn::Residual(const mjModel* model,
 //   If quadruped is within tolerance of goal ->
 //   set goal to next from keyframes.
 // -----------------------------------------------
-void QuadrupedHill::TransitionLocked(mjModel* model, mjData* data) {
+void QuadrupedHillMod::TransitionLocked(mjModel* model, mjData* data) {
   // set mode to GUI selection
   if (mode > 0) {
     residual_.current_mode_ = mode - 1;

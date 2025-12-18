@@ -87,10 +87,11 @@
 #endif
 #if __has_include("mjpc/tasks/quadruped_vanila/quadruped_vanila.h")
 #include "mjpc/tasks/quadruped_vanila/quadruped_vanila.h"
-#define MJPC_HAVE_QUADRUPED 1
-#elif __has_include("mjpc/tasks/quadruped_mod/quadruped_mod.h")
+#define MJPC_HAVE_QUADRUPED_VANILA 1
+#endif
+#if __has_include("mjpc/tasks/quadruped_mod/quadruped_mod.h")
 #include "mjpc/tasks/quadruped_mod/quadruped_mod.h"
-#define MJPC_HAVE_QUADRUPED 1
+#define MJPC_HAVE_QUADRUPED_MOD 1
 #endif
 #if __has_include("mjpc/tasks/rubik/solve.h")
 #include "mjpc/tasks/rubik/solve.h"
@@ -171,9 +172,13 @@ std::vector<std::shared_ptr<Task>> GetTasks() {
 #ifdef MJPC_HAVE_QUADROTOR
   tasks.push_back(std::make_shared<Quadrotor>());
 #endif
-#ifdef MJPC_HAVE_QUADRUPED
+#ifdef MJPC_HAVE_QUADRUPED_VANILA
   tasks.push_back(std::make_shared<QuadrupedFlat>());
   tasks.push_back(std::make_shared<QuadrupedHill>());
+#endif
+#ifdef MJPC_HAVE_QUADRUPED_MOD
+  tasks.push_back(std::make_shared<QuadrupedFlatMod>());
+  tasks.push_back(std::make_shared<QuadrupedHillMod>());
 #endif
 #ifdef MJPC_HAVE_SWIMMER
   tasks.push_back(std::make_shared<Swimmer>());

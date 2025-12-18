@@ -69,6 +69,7 @@ Agent::Agent(const mjModel* model, std::shared_ptr<Task> task)
 
 // initialize data, settings, planners, state
 void Agent::Initialize(const mjModel* model) {
+  (void)model;
   // ----- model ----- //
   mjModel* old_model = model_;
   model_ = mj_copyModel(nullptr, model);  // agent's copy of model
