@@ -96,13 +96,59 @@ bool TaskShouldHoldStartup(double time) {
   std::string xml = sim->agent->GetTaskXmlPath(sim->agent->gui_task_id);
   if (xml.find("quadruped") == std::string::npos) return false;
 
-  // conservative default matching quadruped_mod's startup hold: keep
-  // controllers suppressed for the full startup hold so the robot can
-  // stand and settle before control commands are applied.
-  // NOTE: this mirrors `startup_hold_duration_` used by the quad-mod task
-  // (default 6.0s) so both vanilla and mod quadrupeds behave the same.
-  constexpr double kDefaultStartupHoldTime = 1.0;
-  return time < kDefaultStartupHoldTime;
+  // conservative default matching quadruped_mod's warmup: keep controller
+  // suppression for the initial short warmup (1s). After this warmup the
+  // controller will run normally. Separately, at ~5s we enable manual gait
+  // (select_Gait switch -> Manual) and set gait to Trot (index 2) once.
+  constexpr double kDefaultWarmupZeroTorqueTime = 1.0;
+  constexpr double kManualEnableTime = 5.0;
+  constexpr double kModeSwitchTime = 10.0;
+
+  // One-shot per-task guard for toggling manual trot
+  static int last_task_id = -1;
+  static bool manual_toggled = false;
+  int task_id = sim->agent->gui_task_id;
+  if (last_task_id != task_id) {
+    last_task_id = task_id;
+    manual_toggled = false;
+    // reset mode switch guard for new task
+    /* mode_switched is declared below; reset here by shadowing on next use */
+  }
+
+  // If past the manual enable time, toggle manual trot once.
+  if (!manual_toggled && time >= kManualEnableTime) {
+    // Ensure we have a model loaded and an active task
+    if (m && sim->agent->ActiveTask()) {
+      auto* task = sim->agent->ActiveTask();
+      int gait_idx = mjpc::ParameterIndex(m, "select_Gait");
+      int gait_switch_idx = mjpc::ParameterIndex(m, "select_Gait switch");
+      if (gait_switch_idx >= 0 && gait_switch_idx < static_cast<int>(task->parameters.size())) {
+        task->parameters[gait_switch_idx] = mjpc::ReinterpretAsDouble(0);  // Manual mode
+      }
+      if (gait_idx >= 0 && gait_idx < static_cast<int>(task->parameters.size())) {
+        task->parameters[gait_idx] = mjpc::ReinterpretAsDouble(2);  // Trot (Stand=0, Walk=1, Trot=2)
+      }
+      std::cout << "[MJPC] Enabled manual gait and set Trot at t=" << time << "s for task "
+                << sim->agent->GetTaskXmlPath(task_id) << "\n";
+    }
+    manual_toggled = true;
+  }
+
+  // At kModeSwitchTime, set the global 'Mode' selection to "Walk" once.
+  static bool mode_switched = false;
+  if (last_task_id != task_id) mode_switched = false;
+  if (!mode_switched && time >= kModeSwitchTime) {
+    if (m && sim->agent->ActiveTask()) {
+      int ret = sim->agent->SetModeByName("Walk");
+      if (ret >= 0) {
+        std::cout << "[MJPC] Switched Mode to Walk at t=" << time << "s for task "
+                  << sim->agent->GetTaskXmlPath(task_id) << "\n";
+      }
+    }
+    mode_switched = true;
+  }
+
+  return time < kDefaultWarmupZeroTorqueTime;
 }
 }  // namespace
 
