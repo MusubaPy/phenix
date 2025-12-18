@@ -32,10 +32,10 @@
 
 namespace mjpc {
 std::string QuadrupedHill::XmlPath() const {
-  return GetModelPath("quadruped/task_hill.xml");
+  return GetModelPath("quadruped_vanila/task_hill_vanila.xml");
 }
 std::string QuadrupedFlat::XmlPath() const {
-  return GetModelPath("quadruped/task_flat.xml");
+  return GetModelPath("quadruped_vanila/task_flat_vanila.xml");
 }
 std::string QuadrupedHill::Name() const { return "Quadruped Hill"; }
 std::string QuadrupedFlat::Name() const { return "Quadruped Flat"; }

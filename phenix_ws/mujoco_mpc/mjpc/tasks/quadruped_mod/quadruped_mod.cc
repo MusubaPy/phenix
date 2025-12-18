@@ -383,8 +383,8 @@ std::string QuadrupedHillMod::XmlPath() const {
 std::string QuadrupedFlatMod::XmlPath() const {
   return GetModelPath("quadruped_mod/task_flat_mod.xml");
 }
-std::string QuadrupedHillMod::Name() const { return "Quadruped Hill"; }
-std::string QuadrupedFlatMod::Name() const { return "Quadruped Flat"; }
+std::string QuadrupedHillMod::Name() const { return "Quadruped Hill (mod)"; }
+std::string QuadrupedFlatMod::Name() const { return "Quadruped Flat (mod)"; }
 
 void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
                                             const mjData* data,
@@ -516,7 +516,75 @@ void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
   residual[counter++] = capture_point[0] - avg_foot_pos[0];
   residual[counter++] = capture_point[1] - avg_foot_pos[1];
 
-  // ---------- Ground reaction force collection ----------
+
+  // ---------- Effort ----------
+  mju_scl(residual + counter, data->actuator_force, 2e-2, model->nu);
+  counter += model->nu;
+
+
+  // ---------- Posture ----------
+  double* home = KeyQPosByName(model, data, "home");
+  mju_sub(residual + counter, data->qpos + 7, home + 7, model->nu);
+  if (current_mode_ == kModeFlip) {
+    double flip_time = data->time - mode_start_time_;
+    if (flip_time < crouch_time_) {
+      double* crouch = KeyQPosByName(model, data, "crouch");
+      mju_sub(residual + counter, data->qpos + 7, crouch + 7, model->nu);
+    } else if (flip_time >= crouch_time_ &&
+               flip_time < jump_time_ + flight_time_) {
+      // free legs during flight phase
+      mju_zero(residual + counter, model->nu);
+    }
+  }
+  for (A1Foot foot : kFootAll) {
+    for (int joint = 0; joint < 3; joint++) {
+      residual[counter + 3*foot + joint] *= kJointPostureGain[joint];
+    }
+  }
+  if (current_mode_ == kModeBiped) {
+    // loosen the "hands" in Biped mode
+    bool handstand = ReinterpretAsInt(parameters_[biped_type_param_id_]);
+    double arm_posture = parameters_[arm_posture_param_id_];
+    if (handstand) {
+      residual[counter + 6] *= arm_posture;
+      residual[counter + 7] *= arm_posture;
+      residual[counter + 8] *= arm_posture;
+      residual[counter + 9] *= arm_posture;
+      residual[counter + 10] *= arm_posture;
+      residual[counter + 11] *= arm_posture;
+    } else {
+      residual[counter + 0] *= arm_posture;
+      residual[counter + 1] *= arm_posture;
+      residual[counter + 2] *= arm_posture;
+      residual[counter + 3] *= arm_posture;
+      residual[counter + 4] *= arm_posture;
+      residual[counter + 5] *= arm_posture;
+    }
+  }
+  counter += model->nu;
+
+
+  // ---------- Yaw ----------
+  double torso_heading[2] = {torso_xmat[0], torso_xmat[3]};
+  if (current_mode_ == kModeBiped) {
+    int handstand =
+        ReinterpretAsInt(parameters_[biped_type_param_id_]) ? 1 : -1;
+    torso_heading[0] = handstand * torso_xmat[2];
+    torso_heading[1] = handstand * torso_xmat[5];
+  }
+  mju_normalize(torso_heading, 2);
+  double heading_goal = parameters_[ParameterIndex(model, "Heading")];
+  residual[counter++] = torso_heading[0] - mju_cos(heading_goal);
+  residual[counter++] = torso_heading[1] - mju_sin(heading_goal);
+
+
+  // ---------- Angular momentum ----------
+  mju_copy3(residual + counter, SensorByName(model, data, "torso_angmom"));
+  counter +=3;
+
+
+{
+// ---------- Ground reaction force collection ----------
   auto FootIndexForGeom = [&](int geom_id) -> int {
     if (geom_id < 0) {
       return -1;
@@ -610,73 +678,8 @@ void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
     }
   }
 
-  MaybeLogStep(model, data, contact_info, net_grf, measurement_active_);
-
-
-  // ---------- Effort ----------
-  mju_scl(residual + counter, data->actuator_force, 2e-2, model->nu);
-  counter += model->nu;
-
-
-  // ---------- Posture ----------
-  double* home = KeyQPosByName(model, data, "home");
-  mju_sub(residual + counter, data->qpos + 7, home + 7, model->nu);
-  if (current_mode_ == kModeFlip) {
-    double flip_time = data->time - mode_start_time_;
-    if (flip_time < crouch_time_) {
-      double* crouch = KeyQPosByName(model, data, "crouch");
-      mju_sub(residual + counter, data->qpos + 7, crouch + 7, model->nu);
-    } else if (flip_time >= crouch_time_ &&
-               flip_time < jump_time_ + flight_time_) {
-      // free legs during flight phase
-      mju_zero(residual + counter, model->nu);
-    }
-  }
-  for (A1Foot foot : kFootAll) {
-    for (int joint = 0; joint < 3; joint++) {
-      residual[counter + 3*foot + joint] *= kJointPostureGain[joint];
-    }
-  }
-  if (current_mode_ == kModeBiped) {
-    // loosen the "hands" in Biped mode
-    bool handstand = ReinterpretAsInt(parameters_[biped_type_param_id_]);
-    double arm_posture = parameters_[arm_posture_param_id_];
-    if (handstand) {
-      residual[counter + 6] *= arm_posture;
-      residual[counter + 7] *= arm_posture;
-      residual[counter + 8] *= arm_posture;
-      residual[counter + 9] *= arm_posture;
-      residual[counter + 10] *= arm_posture;
-      residual[counter + 11] *= arm_posture;
-    } else {
-      residual[counter + 0] *= arm_posture;
-      residual[counter + 1] *= arm_posture;
-      residual[counter + 2] *= arm_posture;
-      residual[counter + 3] *= arm_posture;
-      residual[counter + 4] *= arm_posture;
-      residual[counter + 5] *= arm_posture;
-    }
-  }
-  counter += model->nu;
-
-
-  // ---------- Yaw ----------
-  double torso_heading[2] = {torso_xmat[0], torso_xmat[3]};
-  if (current_mode_ == kModeBiped) {
-    int handstand =
-        ReinterpretAsInt(parameters_[biped_type_param_id_]) ? 1 : -1;
-    torso_heading[0] = handstand * torso_xmat[2];
-    torso_heading[1] = handstand * torso_xmat[5];
-  }
-  mju_normalize(torso_heading, 2);
-  double heading_goal = parameters_[ParameterIndex(model, "Heading")];
-  residual[counter++] = torso_heading[0] - mju_cos(heading_goal);
-  residual[counter++] = torso_heading[1] - mju_sin(heading_goal);
-
-
-  // ---------- Angular momentum ----------
-  mju_copy3(residual + counter, SensorByName(model, data, "torso_angmom"));
-  counter +=3;
+  // Measurement gating removed — always log when CSV state is enabled.
+  MaybeLogStep(model, data, contact_info, net_grf, true);
 
   // ---------- Net ground reaction force ----------
   double expected_contact[3] = {model->opt.gravity[0], model->opt.gravity[1],
@@ -1034,171 +1037,47 @@ void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
       residual[counter++] = hind_alignment[1] + front_alignment[1];
     }
   }
-
+}
   // sensor dim sanity check
   CheckSensorDim(model, counter);
 }
 
 // Helper function to print motor torques
-void PrintMotorTorques(const mjModel* model, const mjData* data) {
-  static double last_print_time = -1.0;
-  constexpr double kPrintInterval = 0.1; // Print every 0.1 seconds
-
-  if (last_print_time < 0.0 || data->time - last_print_time >= kPrintInterval) {
-    std::cout << "\n[Motor Torques] Time: " << std::fixed << std::setprecision(3) << data->time << " s\n";
-    std::cout << "--------------------------------------------------\n";
-    for (int i = 0; i < model->nu; ++i) {
-      const char* name = mj_id2name(model, mjOBJ_ACTUATOR, i);
-      double torque = data->actuator_force[i];
-      if (name) {
-        std::cout << std::left << std::setw(15) << name << ": " 
-                  << std::right << std::setw(8) << std::fixed << std::setprecision(3) << torque << " Nm\n";
-      }
-    }
-    std::cout << "--------------------------------------------------\n";
-    last_print_time = data->time;
-  }
-}
+// void PrintMotorTorques(const mjModel* model, const mjData* data) {
+//   static double last_print_time = -1.0;
+//   constexpr double kPrintInterval = 0.1; // Print every 0.1 seconds
+//   if (last_print_time < 0.0 || data->time - last_print_time >= kPrintInterval) {
+//     std::cout << "\n[Motor Torques] Time: " << std::fixed << std::setprecision(3) << data->time << " s\n";
+//     std::cout << "--------------------------------------------------\n";
+//     for (int i = 0; i < model->nu; ++i) {
+//       const char* name = mj_id2name(model, mjOBJ_ACTUATOR, i);
+//       double torque = data->actuator_force[i];
+//       if (name) {
+//         std::cout << std::left << std::setw(15) << name << ": " 
+//                   << std::right << std::setw(8) << std::fixed << std::setprecision(3) << torque << " Nm\n";
+//       }
+//     }
+//     std::cout << "--------------------------------------------------\n";
+//     last_print_time = data->time;
+//   }
+// }
 
 //  ============  transition  ============
 void QuadrupedFlatMod::TransitionLocked(mjModel* model, mjData* data) {
-  PrintMotorTorques(model, data);
+  // PrintMotorTorques(model, data);
   // ---------- handle mjData reset ----------
   if (data->time < residual_.last_transition_time_ ||
       residual_.last_transition_time_ == -1) {
     if (mode != ResidualFn::kModeQuadruped && mode != ResidualFn::kModeBiped) {
       mode = ResidualFn::kModeQuadruped;  // mode stateful, switch to Quadruped
     }
-    // snap back to the crouch keyframe on (re)spawn so the robot begins prone
-    int crouch_id = mj_name2id(model, mjOBJ_KEY, "crouch");
-    if (crouch_id >= 0) {
-      mj_resetDataKeyframe(model, data, crouch_id);
-    }
-    mju_zero(data->qvel, model->nv);
-    mju_zero(data->ctrl, model->nu);
     residual_.last_transition_time_ = residual_.phase_start_time_ =
         residual_.phase_start_ = data->time;
 
-    // reset warmup/measurement bookkeeping
-    residual_.warmup_step_counter_ = 0;
-    residual_.warmup_start_time_ = data->time;
-    residual_.warmup_initialized_ = true;
-    residual_.measurement_active_ = false;
-    residual_.measurement_active_prev_ = false;
-    residual_.startup_begin_time_ = data->time;
-    residual_.startup_walk_triggered_ = false;
-    residual_.startup_height_scale_ = 0.0;
-    residual_.startup_height_start_ = 0.0;
-    residual_.startup_height_captured_ = false;
-    auto csv_state = residual_.csv_log_state_;
-    if (csv_state) {
-      std::lock_guard<std::mutex> csv_lock(csv_state->state_mutex);
-      csv_state->energy_abs = 0.0;
-      csv_state->energy_signed = 0.0;
-      csv_state->last_time = data->time;
-      csv_state->energy_reset_count = 0;
-    }
   }
 
-  if (!residual_.warmup_initialized_) {
-    residual_.warmup_initialized_ = true;
-    residual_.warmup_start_time_ = data->time;
-    residual_.startup_begin_time_ = data->time;
-    residual_.startup_walk_triggered_ = false;
-    residual_.startup_height_scale_ = 0.0;
-    residual_.startup_height_start_ = 0.0;
-    residual_.startup_height_captured_ = false;
-  }
-
-  // warmup and measurement gating: zero torque for initial warmup window,
-  // then skip energy accumulation for a configurable number of steps.
-  residual_.warmup_step_counter_ += 1;
-  double warmup_elapsed = data->time - residual_.warmup_start_time_;
-  double warmup_settle_time =
-      residual_.warmup_skip_steps_ * model->opt.timestep;
-  bool zero_torque_phase = warmup_elapsed < residual_.warmup_zero_torque_time_;
-  bool warmup_phase =
-      warmup_elapsed < residual_.warmup_zero_torque_time_ + warmup_settle_time ||
-      residual_.warmup_step_counter_ < residual_.warmup_skip_steps_;
-
-  if (zero_torque_phase) {
-    // hold zero torque and stand gait during warmup
-    mju_zero(data->ctrl, model->nu);
-    mode = ResidualFn::kModeQuadruped;
-    if (residual_.gait_param_id_ >= 0 &&
-        residual_.gait_param_id_ < parameters.size()) {
-      parameters[residual_.gait_param_id_] =
-          ReinterpretAsDouble(ResidualFn::kGaitStand);
-    }
-  }
-
-  // enforce 5s standstill, then switch to Walk once.
-  double startup_elapsed = data->time - residual_.startup_begin_time_;
-  double ramp_start = residual_.warmup_start_time_ + residual_.warmup_zero_torque_time_;
-  double ramp_elapsed = data->time - ramp_start;
-  double ramp = mju_clip(ramp_elapsed / residual_.startup_ramp_duration_, 0.0, 1.0);
-
-  if (!residual_.startup_height_captured_ && ramp_elapsed >= 0.0) {
-    double* compos = SensorByName(model, data, "torso_subtreecom");
-    residual_.startup_height_start_ = compos[2];
-    residual_.startup_height_captured_ = true;
-  }
-
-  residual_.startup_height_scale_ = ramp;
-  if (!residual_.startup_walk_triggered_) {
-    if (startup_elapsed < residual_.startup_hold_duration_) {
-      mode = ResidualFn::kModeQuadruped;
-      if (residual_.gait_param_id_ >= 0 &&
-          residual_.gait_param_id_ < parameters.size()) {
-        parameters[residual_.gait_param_id_] =
-            ReinterpretAsDouble(ResidualFn::kGaitStand);
-      }
-      if (zero_torque_phase) {
-        mju_zero(data->ctrl, model->nu);
-      }
-    } else {
-      // kick off with a trot in manual mode, then hand back to auto later
-      mode = ResidualFn::kModeWalk;
-      residual_.startup_walk_triggered_ = true;
-      residual_.startup_walk_time_ = data->time;
-      if (residual_.gait_param_id_ >= 0 &&
-          residual_.gait_param_id_ < parameters.size()) {
-        parameters[residual_.gait_param_id_] =
-            ReinterpretAsDouble(ResidualFn::kGaitGallop);
-      }
-      if (residual_.gait_switch_param_id_ >= 0 &&
-          residual_.gait_switch_param_id_ < parameters.size()) {
-        parameters[residual_.gait_switch_param_id_] = ReinterpretAsDouble(0);
-      }
-    }
-  }
-
-  // after a brief delay in Walk, restore auto gait switching
-  /*
-  if (residual_.startup_walk_triggered_ &&
-      residual_.gait_switch_param_id_ >= 0 &&
-      residual_.gait_switch_param_id_ < parameters.size()) {
-    double since_walk = data->time - residual_.startup_walk_time_;
-    int gait_switch = ReinterpretAsInt(parameters[residual_.gait_switch_param_id_]);
-    if (gait_switch == 0 && since_walk >= residual_.startup_auto_delay_) {
-      parameters[residual_.gait_switch_param_id_] = ReinterpretAsDouble(1);
-    }
-  }
-  */
-
-  bool measurement_active = !warmup_phase;
-  if (measurement_active && !residual_.measurement_active_prev_) {
-    auto csv_state = residual_.csv_log_state_;
-    if (csv_state) {
-      std::lock_guard<std::mutex> csv_lock(csv_state->state_mutex);
-      csv_state->energy_abs = 0.0;
-      csv_state->energy_signed = 0.0;
-      csv_state->last_time = data->time;
-      csv_state->energy_reset_count += 1;
-    }
-  }
-  residual_.measurement_active_prev_ = measurement_active;
-  residual_.measurement_active_ = measurement_active;
+  // Warmup/measurement gating removed — CSV logging now uses the logger's
+  // internal bookkeeping only and is always allowed to record when enabled.
 
   // ---------- prevent forbidden mode transitions ----------
   // switching mode, not from quadruped
@@ -1362,14 +1241,6 @@ void QuadrupedFlatMod::TransitionLocked(mjModel* model, mjData* data) {
   residual_.current_mode_ = static_cast<ResidualFn::A1Mode>(mode);
   residual_.last_transition_time_ = data->time;
 }
-
-bool QuadrupedFlatMod::ShouldHoldStartup(double time) const {
-  double warmup_elapsed = time - residual_.warmup_start_time_;
-  return warmup_elapsed < residual_.warmup_zero_torque_time_;
-}
-
-// Startup hold was moved to app.cc's TaskShouldHoldStartup helper so the
-// behavior is consistent for both vanilla and modified quadruped tasks.
 
 // colors of visualisation elements drawn in ModifyScene()
 constexpr float kStepRgba[4] = {0.6, 0.8, 0.2, 1};  // step-height cylinders

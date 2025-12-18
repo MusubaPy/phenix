@@ -55,6 +55,15 @@ int main(int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
 
   std::string task_name = absl::GetFlag(FLAGS_task);
+
+  // If invoked as `mjpc_mod` and the user did not override --task (left as the
+  // default "Quadruped Flat"), prefer the mod task variant by default so the
+  // binary behaves as expected when run without arguments.
+  std::string progname = argv[0] ? std::string(argv[0]) : std::string();
+  if (absl::StrContains(progname, "mjpc_mod") &&
+      absl::EqualsIgnoreCase(task_name, "Quadruped Flat")) {
+    task_name = "Quadruped Flat (mod)";
+  }
   auto tasks = mjpc::GetTasks();
   int task_id = -1;
   for (int i = 0; i < tasks.size(); i++) {

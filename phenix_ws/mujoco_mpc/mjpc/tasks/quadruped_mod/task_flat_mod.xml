@@ -24,9 +24,12 @@
     <numeric name="residual_Duty ratio" data="0 0 1"/>
     <numeric name="residual_Walk speed" data="0.45 0 4"/>
     <numeric name="residual_Walk turn" data="0 -2 2"/>
-  <numeric name="residual_Debug GRF log" data="1 0 1"/>
-  <!-- default GRF cost weight (tuned via sweep). Set to 1.0 for balanced stability+energy -->
-  <numeric name="residual_GRF_weight" data="1.0 0 10" />
+    <numeric name="residual_Debug GRF log" data="1 0 1"/>
+    <!-- default GRF cost weight (tuned via sweep). Set to 1.0 for balanced stability+energy -->
+    <!-- <numeric name="residual_GRF_weight" data="1.0 0 10" /> -->
+    <!-- expose GRF and alignment parameters in the UI -->
+    <!-- <numeric name="residual_GRF" data="1.0 0 10" /> -->
+    <!-- <numeric name="residual_Internal GRF Align" data="1.0 0 10" /> -->
     <numeric name="residual_select_Flip dir" data="0"/>
     <text name="residual_list_Flip dir" data="Back Flip|Front Flip"/>
     <numeric name="residual_select_Biped type" data="0"/>
@@ -146,20 +149,20 @@
     <framepos      name="trace0" objtype="site" objname="head"/>
 
     <!-- residual -->
-    <subtreecom    name="torso_subtreecom" body="trunk"/>
-  <subtreelinvel    name="torso_subtreelinvel" body="trunk"/>
-  <accelerometer    name="torso_subtreelinacc" site="torso"/>
-    <subtreeangmom name="torso_angmom" body="trunk"/>
+    <subtreecom       name="torso_subtreecom" body="trunk"/>
+    <subtreelinvel    name="torso_subtreelinvel" body="trunk"/>
+    <accelerometer    name="torso_subtreelinacc" site="torso"/>
+    <subtreeangmom    name="torso_angmom" body="trunk"/>
   </sensor>
 
   <keyframe>
     <key name="home"
-       qpos="-0.0218846 -0.00761031 0.281501
-         0.99944162 0.01901863 0.00176466 -0.02741594
-         -0.00181525 0.00123972 -0.0485806
-         -0.00349432 0.00500918 -0.023133
-         -0.00118292 -0.0109732 -0.0465082
-         0.0116829 -0.0201041 -0.065258"/>
+         qpos="0 0 0.26
+               1 0 0 0
+               -0.000341931 0.0181576 -0.0268335
+               0.00160968 0.0247957 -0.0270045
+               0.00191398 -0.033048 -0.0675298
+               -0.00199489 -0.0374747 -0.0681862"/>
     <key name="crouch"
          qpos="-0.0501827 0.00107117 0.143925
                1 0 0 0

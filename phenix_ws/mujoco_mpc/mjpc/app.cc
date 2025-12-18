@@ -96,9 +96,13 @@ bool TaskShouldHoldStartup(double time) {
   std::string xml = sim->agent->GetTaskXmlPath(sim->agent->gui_task_id);
   if (xml.find("quadruped") == std::string::npos) return false;
 
-  // conservative default matching quadruped_mod's default of 1.0s
-  constexpr double kDefaultWarmupZeroTorqueTime = 1.0;
-  return time < kDefaultWarmupZeroTorqueTime;
+  // conservative default matching quadruped_mod's startup hold: keep
+  // controllers suppressed for the full startup hold so the robot can
+  // stand and settle before control commands are applied.
+  // NOTE: this mirrors `startup_hold_duration_` used by the quad-mod task
+  // (default 6.0s) so both vanilla and mod quadrupeds behave the same.
+  constexpr double kDefaultStartupHoldTime = 1.0;
+  return time < kDefaultStartupHoldTime;
 }
 }  // namespace
 

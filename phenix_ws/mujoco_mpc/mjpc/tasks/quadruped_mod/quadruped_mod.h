@@ -148,7 +148,7 @@ class QuadrupedFlatMod : public Task {
     constexpr static double kAutoGaitMinTime = 1;     // second
 
     // target torso height over feet when quadrupedal
-    constexpr static double kHeightQuadruped = 0.255;  // meter
+    constexpr static double kHeightQuadruped = 0.25;  // meter
 
     // target torso height over feet when bipedal
     constexpr static double kHeightBiped = 0.6;       // meter
@@ -224,14 +224,7 @@ class QuadrupedFlatMod : public Task {
     double com_vel_[2]        = {0};
     double gait_switch_time_  = 0;
 
-    // warmup / measurement gating
-    double warmup_zero_torque_time_ = 1.0;   // seconds of zero torque hold
-    int warmup_skip_steps_ = 2000;           // steps to skip before measuring
-    double warmup_start_time_ = 0.0;
-    int warmup_step_counter_ = 0;
-    bool warmup_initialized_ = false;
-    bool measurement_active_ = false;
-    bool measurement_active_prev_ = false;
+    // (Warmup/measurement gating removed — logging now always allowed)
 
     // startup hold then auto-walk
     double startup_hold_duration_ = 6.0;  // stand still duration
