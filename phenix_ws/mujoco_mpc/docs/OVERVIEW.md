@@ -251,7 +251,7 @@ The repository includes additional example tasks:
 - [Cart-Pole](../mjpc/tasks/cartpole/task.xml)
 - [Acrobot](../mjpc/tasks/acrobot/task.xml)
 - [Particle](../mjpc/tasks/particle/task.xml)
-- Quadruped [Hill](../mjpc/tasks/quadruped/task_hill.xml) | [Flat](../mjpc/tasks/quadruped/task_flat.xml)
+- Quadruped [Hill](../mjpc/tasks/quadruped_vanila/task_hill.xml) | [Flat](../mjpc/tasks/quadruped_vanila/task_flat.xml)
 - [In-Hand Manipulation](../mjpc/tasks/hand/task.xml)
 - [Quadrotor](../mjpc/tasks/quadrotor/task.xml)
 - [Panda Arm Manipulation](../mjpc/tasks/panda/task.xml)
@@ -267,7 +267,7 @@ void TransitionLocked(mjModel* model, mjData* data)
 - `model`: the task's `mjModel`. A transition could mutate fields of `mjModel`.
 - `data`: the task's `mjData`.  A transition should mutate fields of `mjData`, see below.
 
-Because we only sync the `mjData` [state](https://mujoco.readthedocs.io/en/latest/computation.html?highlight=state#the-state) between the GUI and the agent's planner, tasks that need transitions should use `mocap` [fields](https://mujoco.readthedocs.io/en/latest/modeling.html#cmocap) or `userdata` to specify goals.  For code examples, see the `Transition` functions in these example tasks: [Swimmer](../mjpc/tasks/swimmer/swimmer.cc) (relocating the target), [Quadruped](../mjpc/tasks/quadruped/quadruped.cc) (iterating along a fixed set of targets) and [Hand](../mjpc/tasks/hand/hand.cc) (recovering when the cube is dropped).
+Because we only sync the `mjData` [state](https://mujoco.readthedocs.io/en/latest/computation.html?highlight=state#the-state) between the GUI and the agent's planner, tasks that need transitions should use `mocap` [fields](https://mujoco.readthedocs.io/en/latest/modeling.html#cmocap) or `userdata` to specify goals.  For code examples, see the `Transition` functions in these example tasks: [Swimmer](../mjpc/tasks/swimmer/swimmer.cc) (relocating the target), [Quadruped](../mjpc/tasks/quadruped_vanila/quadruped.cc) (iterating along a fixed set of targets) and [Hand](../mjpc/tasks/hand/hand.cc) (recovering when the cube is dropped).
 
 Additionally, custom labeled buttons can be added to the GUI by specifying a string of labels delimited with a pipe character: `|`. For example:
 ```xml

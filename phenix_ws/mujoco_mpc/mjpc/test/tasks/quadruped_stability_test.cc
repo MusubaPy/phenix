@@ -25,7 +25,7 @@
 #include "gtest/gtest.h"
 #include <mujoco/mujoco.h>
 #include "mjpc/agent.h"
-#include "mjpc/tasks/quadruped/quadruped.h"
+#include "mjpc/tasks/quadruped_vanila/quadruped_vanila.h"
 #include "mjpc/tasks/tasks.h"
 #include "mjpc/threadpool.h"
 #include "mjpc/utilities.h"

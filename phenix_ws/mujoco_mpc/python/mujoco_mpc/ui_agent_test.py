@@ -172,8 +172,8 @@ class UiAgentTest(absltest.TestCase):
 
   def test_get_all_modes(self):
     model_path = (
-        pathlib.Path(__file__).parent.parent.parent
-        / "build/mjpc/tasks/quadruped/task_flat.xml"
+      pathlib.Path(__file__).parent.parent.parent
+      / "build/mjpc/tasks/quadruped_vanila/task_flat.xml"
     )
     model = mujoco.MjModel.from_xml_path(str(model_path))
     with self.get_agent(task_id="Quadruped Flat", model=model) as agent:
@@ -185,8 +185,8 @@ class UiAgentTest(absltest.TestCase):
   @absltest.skip("asset import issue")
   def test_get_set_mode(self):
     model_path = (
-        pathlib.Path(__file__).parent.parent.parent
-        / "build/mjpc/tasks/quadruped/task_flat.xml"
+      pathlib.Path(__file__).parent.parent.parent
+      / "build/mjpc/tasks/quadruped_vanila/task_flat.xml"
     )
     model = mujoco.MjModel.from_xml_path(str(model_path))
     with self.get_agent(task_id="Quadruped Flat", model=model) as agent:
@@ -196,8 +196,8 @@ class UiAgentTest(absltest.TestCase):
   @absltest.skip("asset import issue")
   def test_set_mode_error(self):
     model_path = (
-        pathlib.Path(__file__).parent.parent.parent
-        / "build/mjpc/tasks/quadruped/task_flat.xml"
+      pathlib.Path(__file__).parent.parent.parent
+      / "build/mjpc/tasks/quadruped_vanila/task_flat.xml"
     )
     model = mujoco.MjModel.from_xml_path(str(model_path))
     with self.get_agent(task_id="Quadruped Flat", model=model) as agent:

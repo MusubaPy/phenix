@@ -108,8 +108,8 @@ class AgentTest(parameterized.TestCase):
 
   def test_env_initialized_to_home_keyframe(self):
     model_path = (
-        pathlib.Path(__file__).parent.parent.parent
-        / "build/mjpc/tasks/quadruped/task_flat.xml"
+      pathlib.Path(__file__).parent.parent.parent
+      / "build/mjpc/tasks/quadruped_vanila/task_flat.xml"
     )
     model = mujoco.MjModel.from_xml_path(str(model_path))
 
@@ -340,8 +340,8 @@ class AgentTest(parameterized.TestCase):
   @absltest.skip("asset import issue")
   def test_get_set_mode(self):
     model_path = (
-        pathlib.Path(__file__).parent.parent.parent
-        / "build/mjpc/tasks/quadruped/task_flat.xml"
+      pathlib.Path(__file__).parent.parent.parent
+      / "build/mjpc/tasks/quadruped_vanila/task_flat.xml"
     )
     model = mujoco.MjModel.from_xml_path(str(model_path))
     with agent_lib.Agent(task_id="Quadruped Flat", model=model) as agent:
@@ -351,8 +351,8 @@ class AgentTest(parameterized.TestCase):
   @absltest.skip("asset import issue")
   def test_get_all_modes(self):
     model_path = (
-        pathlib.Path(__file__).parent.parent.parent
-        / "build/mjpc/tasks/quadruped/task_flat.xml"
+      pathlib.Path(__file__).parent.parent.parent
+      / "build/mjpc/tasks/quadruped_vanila/task_flat.xml"
     )
     model = mujoco.MjModel.from_xml_path(str(model_path))
     with agent_lib.Agent(task_id="Quadruped Flat", model=model) as agent:
@@ -364,8 +364,8 @@ class AgentTest(parameterized.TestCase):
   @absltest.skip("asset import issue")
   def test_set_mode_error(self):
     model_path = (
-        pathlib.Path(__file__).parent.parent.parent
-        / "build/mjpc/tasks/quadruped/task_flat.xml"
+      pathlib.Path(__file__).parent.parent.parent
+      / "build/mjpc/tasks/quadruped_vanila/task_flat.xml"
     )
     model = mujoco.MjModel.from_xml_path(str(model_path))
     with agent_lib.Agent(task_id="Quadruped Flat", model=model) as agent:

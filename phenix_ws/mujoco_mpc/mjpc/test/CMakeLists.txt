@@ -27,6 +27,15 @@ macro(test name)
   )
   target_include_directories(${name} PRIVATE ${MUJOCO_TEST_INCLUDE})
   set_target_properties(${name} PROPERTIES BUILD_RPATH ${CMAKE_LIBRARY_OUTPUT_DIRECTORY})
+  # Ensure tests are placed in the project build bin directory so that the
+  # generated CTest files reference the correct runtime path (e.g. build/bin)
+  set_target_properties(
+    ${name}
+    PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${CMAKE_INSTALL_BINDIR}"
+      RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/${CMAKE_INSTALL_BINDIR}"
+      RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/${CMAKE_INSTALL_BINDIR}"
+  )
   # gtest_discover_tests is recommended over gtest_add_tests, but has some issues in Windows.
   gtest_add_tests(
     TARGET ${name}

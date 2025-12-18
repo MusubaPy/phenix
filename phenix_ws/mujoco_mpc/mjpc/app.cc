@@ -42,7 +42,7 @@ ABSL_DECLARE_FLAG(double, max_sim_time);
 #include "mjpc/task.h"
 #include "mjpc/threadpool.h"
 #include "mjpc/utilities.h"
-#include "mjpc/tasks/quadruped/quadruped.h"
+#include "mjpc/tasks/quadruped_vanila/quadruped_vanila.h"
 
 ABSL_FLAG(bool, planner_enabled, true,
           "If true, the planner will run on startup");
