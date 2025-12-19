@@ -23,12 +23,24 @@ import statistics
 ROOT = Path(__file__).resolve().parents[1]
 BIN_BASE = ROOT / 'build' / 'bin'
 OUTDIR = ROOT / 'logs' / 'baseline_vs_mod'
-RUNS_PER_TAG = 2
+RUNS_PER_TAG = 3
 TMIN = 10.0
 TMAX = 60.0
 MAX_SIM_TIME = 62.0
 TASK_NAME = 'Quadruped Flat'
 TAGS = [('baseline', 'mjpc_vanila'), ('modified', 'mjpc_mod')]
+
+# Per-tag environment overrides (keep baseline unchanged; use conservative params for mod)
+TAG_ENV_OVERRIDES = {
+    'baseline': {},
+    'modified': {
+        'MJPC_CTRL_CLIP': '50',
+        'MJPC_GRF_HIND_WEIGHT': '0.03',
+        'MJPC_GRF_FRONT_WEIGHT': '0.01',
+        # ensure a slightly longer sim window (safe) if needed
+        'MJPC_MAX_SIM_TIME': str(MAX_SIM_TIME),
+    }
+}
 
 
 def run_once(binpath, task, out_csv, env_overrides=None, max_sim_time=None):
@@ -129,7 +141,8 @@ def main():
             csv_path = OUTDIR / f"{tag}_r{i}.csv"
             if csv_path.exists():
                 csv_path.unlink()
-            ok = run_once(binpath, TASK_NAME, csv_path, env_overrides={}, max_sim_time=MAX_SIM_TIME)
+            env_overrides = TAG_ENV_OVERRIDES.get(tag, {})
+            ok = run_once(binpath, TASK_NAME, csv_path, env_overrides=env_overrides, max_sim_time=MAX_SIM_TIME)
             if not csv_path.exists():
                 print('ERROR: missing', csv_path)
                 with results_csv.open('a', newline='') as f:

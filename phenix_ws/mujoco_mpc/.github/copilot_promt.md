@@ -16,19 +16,17 @@ cmake --build .
 ```bash
 MJPC_CSV_LOG=logs/run.csv MJPC_MAX_SIM_TIME=45 build/bin/mjpc_mod --task="Quadruped Flat (mod)"
 ```
-- Пример запуска GRF-sweep (варианты A/B/C):
-```bash
-BUILD_BIN=build/bin/mjpc_mod bash scripts/run_grf_variants.sh 1e-8 3
-```
 
-## Тесты и smoke checks ✅
-- Запуск smoke tests:
+Примечание: **`vanila`** — это baseline (используйте `build/bin/mjpc_vanila`), **`mod`** — наша модификация (используйте `build/bin/mjpc_mod`).
+
+Примеры (быстрый quickstart):
 ```bash
-python3 -m pytest scripts/tests/test_smoke_pipeline.py
+# мод, прогон с CSV и 60s
+MJPC_CSV_LOG=logs/one_off_run/run.csv MJPC_MAX_SIM_TIME=60 build/bin/mjpc_mod
+
+# vanila baseline
+MJPC_CSV_LOG=logs/vanila_run/run.csv MJPC_MAX_SIM_TIME=60 build/bin/mjpc_vanila
 ```
-- Короткие проверки, которые должны проходить:
-  - `scripts/convert_mjpc_csv.py` — header строки LF-only
-  - `scripts/compute_metrics.py` — выводит pitch, roll, energy; поддерживает `MJPC_MIN_TRAVEL_DISTANCE_M`
 
 ## Data pipeline — что и где 📁
 - `scripts/convert_mjpc_csv.py` — делает `_conv.csv` с детерминированным LF-only header.
@@ -37,21 +35,59 @@ python3 -m pytest scripts/tests/test_smoke_pipeline.py
 - `scripts/collect_datasets.py` — универсальный сборщик (run→convert→metrics) и пишет `results.csv`.
 - `scripts/run_full_comparison.py` — runner для baseline vs modified (по-умолчанию тримит [10s,60s]).
 
-## Важные env-переменные для экспериментов (актуальные) 🧪
-- `MJPC_GRF_WEIGHT`
-- `MJPC_GRF_PER_FOOT_SCALE` (формат `f0,f1,f2,f3`)
-- `MJPC_GRF_TRANSITION_BOOST`
-- `MJPC_GRF_NORMALIZE` (0/1)
-- `MJPC_GRF_LOSS_MIX` (0..1)
-- `MJPC_INTERNAL_GRF_ALIGN_WEIGHT` (internal override)
-- `MJPC_MIN_TRAVEL_DISTANCE_M` (по умолчанию 5.0, можно временно установить 0 для отладки)
-- `MJPC_MAX_SIM_TIME` (s)
-- `MJPC_CSV_LOG` (куда писать лог)
+## Анализ результатов
+- Быстрая оценка одного CSV (рекомендуется — использует интегрированную энергию):
+```bash
+python3 scripts/gait_evaluator.py --csv logs/<run>/run.csv --log logs/<run>/run.log --out logs/<run>/run_eval_fixed.json --plots logs/<run>/plots_fixed
+```
+- Важное замечание: используйте `energy_per_m_corrected` (интеграл torque_applied*joint_vel) для сравнения энергозатрат — оно более надёжное, чем сырое поле `energy_abs_j` в CSV.
 
-## Логи и результаты — где искать
-- Sweep outputs: `logs/sweep_grf/variants` (raw CSV + `_conv.csv`)
-- Baseline vs modified: `logs/baseline_vs_mod/results.csv`
-- Если `compute_metrics.py` возвращает `NO_TRAVEL`, обычно причина — симуляция не прошла достаточное расстояние; сначала попробуйте увеличить `MJPC_MAX_SIM_TIME`, либо временно `MJPC_MIN_TRAVEL_DISTANCE_M=0` для быстрой проверки.
+## Важные env-переменные для экспериментов (актуальные) 🧪
+    env.update({
+        # Core experiment controls
+        'MJPC_CSV_LOG': csv_path,
+        'MJPC_MAX_SIM_TIME': '60',           # seconds per run
+        # Fix seed to 1 unless explicitly changed via --seed or --extra-env.
+        # Do NOT inherit MJPC_SEED from the caller environment to avoid
+        # accidental variation during quick checks.
+        'MJPC_SEED': str(seed if seed is not None else 1),
+
+        # Cost/penalty knobs
+        'MJPC_GRF_WEIGHT': '1e-5',              # global GRF cost scalar (0 disables)
+        'MJPC_GRF_PER_FOOT_SCALE': '0.8,0.8,1.2,1.2',  # per-foot GRF scaling
+        'MJPC_GRF_HIND_WEIGHT': '1e-7',
+        'MJPC_GRF_FRONT_WEIGHT': '1e-7',
+        'MJPC_INTERNAL_GRF_ALIGN_WEIGHT': env.get('MJPC_INTERNAL_GRF_ALIGN_WEIGHT', '1e-3'),
+        'MJPC_TARGET_SMOOTH_TAU': str(tau),  # smoothing tau
+        'MJPC_TARGET_BLEND_ALPHA': str(alpha),
+        'MJPC_FIXATION_WEIGHT': env.get('MJPC_FIXATION_WEIGHT', '1e-4'),
+        'MJPC_POWER_PENALTY_WEIGHT': env.get('MJPC_POWER_PENALTY_WEIGHT', '0'),
+        'MJPC_POWER_PENALTY_MODE': env.get('MJPC_POWER_PENALTY_MODE', ''),
+        'MJPC_HEIGHT_WEIGHT_SCALE': env.get('MJPC_HEIGHT_WEIGHT_SCALE', '1.0'),
+        'MJPC_BIARTICULAR_GAIN': env.get('MJPC_BIARTICULAR_GAIN', '0.0'),
+
+        # GRF control/misc
+        'MJPC_GRF_TRANSITION_BOOST': env.get('MJPC_GRF_TRANSITION_BOOST', '0.0'),
+        'MJPC_GRF_NORMALIZE': env.get('MJPC_GRF_NORMALIZE', '0'),
+        'MJPC_GRF_LOSS_MIX': env.get('MJPC_GRF_LOSS_MIX', '0.0'),
+        'MJPC_GRF_MOTOR_BLEND': env.get('MJPC_GRF_MOTOR_BLEND', '0.0'),
+        'MJPC_DISABLE_MOTOR_BLEND': env.get('MJPC_DISABLE_MOTOR_BLEND', '0'),
+        'MJPC_GRF_TARGET_MODE': env.get('MJPC_GRF_TARGET_MODE', ''),
+
+        # Simulation / stability controls
+        'MJPC_CONTACT_STABLE_STEPS': env.get('MJPC_CONTACT_STABLE_STEPS', '10'),
+        'MJPC_CTRL_CLIP': env.get('MJPC_CTRL_CLIP', '100'),
+        'MJPC_MIN_TRAVEL_DISTANCE_M': env.get('MJPC_MIN_TRAVEL_DISTANCE_M', '0'),
+
+        # Sensor / debugging (advanced)
+        'MJPC_GRF_SENSOR_SCALE': env.get('MJPC_GRF_SENSOR_SCALE', '1.0'),
+        'MJPC_REFLECT_NET_FORCE_GAIN': env.get('MJPC_REFLECT_NET_FORCE_GAIN', '0.0'),
+
+        # Metrics (post-processing helpers)
+        'MJPC_METRICS_START_SEC': env.get('MJPC_METRICS_START_SEC', ''),
+        'MJPC_METRICS_END_SEC': env.get('MJPC_METRICS_END_SEC', ''),
+    })
+
 
 ## Ключевые места в кодовой базе
 - `mjpc/` — основной C++ код (tasks, planners, residuals)
@@ -61,7 +97,7 @@ python3 -m pytest scripts/tests/test_smoke_pipeline.py
 - `logs/` — все результаты прогонов и summary CSV
 
 ---
-Если нужно, добавлю шаблоны команд для воспроизведения полного sweep с рекомендуемыми env и N≥3, а также чеклист для отлова нестабильных прогонов (NaN / Rollout divergence).
+
 # Инструкция для Copilot
 
 Говори по-русски. Пиши и правь C++-код в рамках текущей архитектуры, делай его понятным и лаконичным. Поддерживай компиляцию и запуск без ошибок, добавляй недостающие зависимости и согласовывай сопряженные файлы. Минимизируй изменения архитектуры.

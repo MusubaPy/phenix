@@ -17,6 +17,22 @@ spec = importlib.util.spec_from_file_location(
 gm = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gm)
 get_value = gm.get_value
+import os
+
+# allow overriding analysis start/end window via environment variables
+# (common workflow: analyze 10..60 s). Example:
+# MJPC_METRICS_START_SEC=10 MJPC_METRICS_END_SEC=60 python3 compute_metrics.py ...
+if os.environ.get('MJPC_METRICS_START_SEC') is not None:
+    try:
+        gm.start_time_sec = float(os.environ.get('MJPC_METRICS_START_SEC'))
+    except Exception:
+        pass
+_METRICS_END_SEC = None
+if os.environ.get('MJPC_METRICS_END_SEC') is not None:
+    try:
+        _METRICS_END_SEC = float(os.environ.get('MJPC_METRICS_END_SEC'))
+    except Exception:
+        _METRICS_END_SEC = None
 
 
 def summarize(path):
@@ -56,8 +72,14 @@ def summarize_with_min_travel(path, min_travel=0.5):
     wall_crash_seconds = gm.wall_crash * gm.step
     if pd is not None:
         max_time = float(ds.index.max())
-        end_time = max_time - wall_crash_seconds
-        ds_trim = ds[(ds.index >= gm.start_time_sec) & (ds.index <= end_time)]
+        # If an explicit end time was provided via env var, use it; otherwise
+        # use the original wall_crash trimming behaviour.
+        if _METRICS_END_SEC is not None:
+            end_time = _METRICS_END_SEC
+        else:
+            end_time = max_time - wall_crash_seconds
+        start_time = gm.start_time_sec
+        ds_trim = ds[(ds.index >= start_time) & (ds.index <= end_time)]
         if ds_trim.shape[0] == 0:
             return None
     else:
@@ -65,8 +87,12 @@ def summarize_with_min_travel(path, min_travel=0.5):
         if ds_index is None:
             return None
         max_time = max(ds_index)
-        end_time = max_time - wall_crash_seconds
-        mask = [(t >= gm.start_time_sec) and (t <= end_time) for t in ds_index]
+        if _METRICS_END_SEC is not None:
+            end_time = _METRICS_END_SEC
+        else:
+            end_time = max_time - wall_crash_seconds
+        start_time = gm.start_time_sec
+        mask = [(t >= start_time) and (t <= end_time) for t in ds_index]
         if not any(mask):
             return None
         def apply_mask(lst):

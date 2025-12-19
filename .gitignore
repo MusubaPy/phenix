@@ -23,6 +23,7 @@ phenix_ws/mujoco_mpc/_deps/*/CMakeFiles/
 phenix_ws/mujoco_mpc/lib/pkgconfig/
 
 # General build/IDE/temp files
+**/_deps/
 **/build/
 **/CMakeFiles/
 **/CMakeCache.txt

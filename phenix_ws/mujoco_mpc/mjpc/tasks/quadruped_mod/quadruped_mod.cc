@@ -42,6 +42,8 @@ constexpr double kDebugTimeEpsilon = 1e-6;    // tolerance for time comparisons
 constexpr double kDebugResetThreshold =
   4 * kDebugPrintInterval;  // difference treated as a real reset
 
+constexpr int kContactStableSteps = 5;  // number of consecutive contact steps for stability gating
+
 constexpr const char* kFootLabels[4] = {"FL", "HL", "FR", "HR"};
 
 std::mutex& DebugMutex() {
@@ -51,6 +53,13 @@ std::mutex& DebugMutex() {
 
 std::string BuildDebugHeader() {
   std::ostringstream oss;
+  
+    // ==================== MOD: GRF tuning & experimental envs ====================
+    // Grouped area for all runtime GRF-related experiment flags and per-foot
+    // tuning parameters added in the 'mod' variant. Keeping them together helps
+    // orient tests and sweep scripts to a single location.
+    // IMPORTANT: runtime GRF sensor scaling (MJPC_GRF_SENSOR_SCALE) is
+    // intentionally disabled in this variant to avoid masking energy effects.
   std::vector<std::string> headers = {
     "time",
     "net_force[x y z]",
@@ -118,6 +127,7 @@ std::string BuildDebugRow(double time, const double net_force[3],
 
 void ProjectOntoPlane(double out[3], const double v[3],
                       const double normal[3]) {
+    // ================== END MOD: GRF tuning & experimental envs ==================
   double n[3] = {normal[0], normal[1], normal[2]};
   double norm = mju_norm3(n);
   if (norm < kPlaneProjectionEps) {
@@ -151,9 +161,16 @@ struct MotorSelectionResult {
   double normal_proj[3];
 };
 
+// ---------------- MOD: motor selection helper ----------------
+// This helper selects the best motor projection for a contact normal and
+// optionally performs softmax blending between motor vectors when
+// residual_.grf_motor_blend_beta_ > 0.
+// Keep this helper near the top of the file; unit tests reference it.
+
 MotorSelectionResult SelectMotorUsingNormal(const double contact_normal[3],
                                             const double motor_vectors[2][3],
-                                            const double plane_normal[3]) {
+                                            const double plane_normal[3],
+                                            double blend_beta = 0.0) {
   MotorSelectionResult result{-1, 0.0, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
 
   double normal_proj[3];
@@ -164,46 +181,77 @@ MotorSelectionResult SelectMotorUsingNormal(const double contact_normal[3],
     return result;
   }
 
-  // Softmax blending parameters
-  const double kBeta = 10.0; 
-  double weights[2] = {0.0, 0.0};
   double proj_vectors[2][3];
   double angles[2];
-  double weight_sum = 0.0;
-  bool any_valid = false;
-
+  bool valid[2] = {false, false};
+  int valid_count = 0;
   for (int i = 0; i < 2; ++i) {
     ProjectOntoPlane(proj_vectors[i], motor_vectors[i], plane_normal);
     double norm = mju_norm3(proj_vectors[i]);
     if (norm < kPlaneProjectionEps) {
-        weights[i] = 0.0;
-        angles[i] = 100.0; // Large angle
-        continue;
+      angles[i] = std::numeric_limits<double>::infinity();
+      continue;
     }
-    any_valid = true;
     angles[i] = AngleBetween(normal_proj, proj_vectors[i]);
-    weights[i] = std::exp(-kBeta * angles[i]);
-    weight_sum += weights[i];
+    valid[i] = true;
+    valid_count += 1;
   }
 
-  if (!any_valid || weight_sum < 1e-9) {
-      return result;
-  }
+  if (valid_count == 0) return result;
 
-  // Blend vectors
-  double blended_vector[3] = {0.0, 0.0, 0.0};
-  for (int i = 0; i < 2; ++i) {
-      if (weights[i] > 0) {
-          mju_addToScl3(blended_vector, proj_vectors[i], weights[i] / weight_sum);
+  // If a blend beta is provided, perform a softmax blend of the projected
+  // motor vectors to avoid abrupt switching (helps numerical solvers).
+  if (blend_beta > 0.0) {
+    double weights[2] = {0.0, 0.0};
+    double weight_sum = 0.0;
+    for (int i = 0; i < 2; ++i) {
+      if (valid[i]) {
+        weights[i] = std::exp(-blend_beta * angles[i]);
+        weight_sum += weights[i];
       }
+    }
+    if (weight_sum < 1e-12) return result;
+    double blended_vector[3] = {0.0, 0.0, 0.0};
+    for (int i = 0; i < 2; ++i) {
+      if (weights[i] > 0) {
+        mju_addToScl3(blended_vector, proj_vectors[i], weights[i] / weight_sum);
+      }
+    }
+    result.index = -1;  // indicates blended selection
+    result.angle = mju_min(angles[0], angles[1]);
+    mju_copy3(result.motor_proj, blended_vector);
+    return result;
   }
 
-  // Fill result
-  result.index = 0; // Dummy valid index to indicate success
-  result.angle = 0.0; // Dummy angle
-  mju_copy3(result.motor_proj, blended_vector);
-  
+  // pick best index (minimum angle)
+  int best = (angles[0] <= angles[1]) ? 0 : 1;
+  if (!valid[best]) {
+    best = valid[0] ? 0 : (valid[1] ? 1 : -1);
+  }
+  if (best < 0) return result;
+
+  // fill result with chosen motor projection and angle
+  result.index = best;
+  result.angle = angles[best];
+  mju_copy3(result.motor_proj, proj_vectors[best]);
   return result;
+}
+
+// Helper exposed for unit tests: compute plane normal from three points.
+bool ComputePlaneFromPoints(const double hip_anchor[3],
+                            const double knee_anchor[3],
+                            const double foot_point[3],
+                            double plane_normal_out[3]) {
+  double vec_knee_hip[3];
+  double vec_knee_foot[3];
+  mju_sub3(vec_knee_hip, hip_anchor, knee_anchor);
+  mju_sub3(vec_knee_foot, foot_point, knee_anchor);
+  double plane_normal[3];
+  mju_cross(plane_normal, vec_knee_hip, vec_knee_foot);
+  double norm = mju_norm3(plane_normal);
+  if (norm < kPlaneProjectionEps) return false;
+  mju_scl3(plane_normal_out, plane_normal, 1.0 / norm);
+  return true;
 }
 
 struct PlaneData {
@@ -239,15 +287,22 @@ bool ComputePlaneData(const mjData* data, const double* foot_pos,
   mju_sub3(vec_knee_foot, plane->foot_point, plane->knee_anchor);
 
   double plane_normal[3];
-  mju_cross(plane_normal, vec_knee_hip, vec_knee_foot);
-  if (mju_norm3(plane_normal) < kPlaneProjectionEps) {
-    return false;
+  if (!ComputePlaneFromPoints(vec_knee_hip, vec_knee_foot, plane->foot_point,
+                              plane_normal)) {
+    // Fallback: attempt to compute using original anchors
+    double real_plane_normal[3];
+    mju_cross(real_plane_normal, vec_knee_hip, vec_knee_foot);
+    if (mju_norm3(real_plane_normal) < kPlaneProjectionEps) {
+      return false;
+    }
+    mju_copy3(plane->plane_normal, real_plane_normal);
+  } else {
+    mju_copy3(plane->plane_normal, plane_normal);
   }
-
-  mju_copy3(plane->plane_normal, plane_normal);
   plane->valid = true;
   return true;
 }
+
 }  // namespace
 
 namespace mjpc {
@@ -314,7 +369,20 @@ void QuadrupedFlatMod::ResidualFn::MaybeLogStep(
       hdr << ",grf_" << kFootLabels[foot] << "_fy";
       hdr << ",grf_" << kFootLabels[foot] << "_fz";
     }
+    // MOD: add target-joint trace and penalties to CSV header
+    for (int foot = 0; foot < 4; ++foot) {
+      hdr << ",target_joint_" << kFootLabels[foot];
+      hdr << ",target_tx_" << kFootLabels[foot];
+      hdr << ",target_ty_" << kFootLabels[foot];
+      hdr << ",target_tz_" << kFootLabels[foot];
+    }
+    hdr << ",power_penalty_total";
+    hdr << ",fixation_penalty_total";
     hdr << ",energy_abs_j,energy_signed_j,phase_tag";
+    // Log current knobs/weights for debugging cost effects
+    hdr << ",fixation_weight,power_penalty_weight,target_smooth_tau,target_blend_alpha";
+    hdr << ",grf_weight_default,grf_per_foot_scale_0,grf_per_foot_scale_1,grf_per_foot_scale_2,grf_per_foot_scale_3";
+    hdr << ",internal_grf_align_weight,mode,gait";
     hdr << '\n';
     state->stream << hdr.str();
     state->header_written = true;
@@ -359,6 +427,35 @@ void QuadrupedFlatMod::ResidualFn::MaybeLogStep(
     }
   }
 
+  // compute and append power_penalty and fixation totals for logging
+  double power_pen_total = 0.0;
+  if (power_penalty_weight_ > 0.0) {
+    for (int i = 0; i < model->nu; ++i) {
+      int joint_id = model->actuator_trnid[2*i];
+      double vel = 0.0;
+      if (joint_id >= 0) {
+        int dof_adr = model->jnt_dofadr[joint_id];
+        if (dof_adr >= 0) vel = data->qvel[dof_adr];
+      }
+      power_pen_total += std::abs(data->actuator_force[i] * vel);
+    }
+  }
+  double fixation_pen_total = 0.0;
+  if (fixation_weight_ > 0.0) {
+    for (A1Foot foot : kFootAll) {
+      for (int joint = 0; joint < 3; ++joint) {
+        int model_joint_id = -1;
+        if (joint == 0) model_joint_id = abduction_joint_id_[foot];
+        else if (joint == 1) model_joint_id = hip_joint_id_[foot];
+        else model_joint_id = knee_joint_id_[foot];
+        if (model_joint_id >= 0) {
+          int dof_adr = model->jnt_dofadr[model_joint_id];
+          if (dof_adr >= 0) fixation_pen_total += std::abs(data->qvel[dof_adr]);
+        }
+      }
+    }
+  }
+
   for (int foot = 0; foot < 4; ++foot) {
     const FootContactInfo& info = contact_info[foot];
     row << ',' << info.force[0] << ',' << info.force[1] << ','
@@ -370,11 +467,51 @@ void QuadrupedFlatMod::ResidualFn::MaybeLogStep(
     state->energy_abs += step_energy_abs;
   }
 
+  // append energy and custom penalties
   row << ',' << state->energy_abs << ',' << state->energy_signed
+      << ',' << power_pen_total << ',' << fixation_pen_total
       << ',' << (measurement_active ? 1 : 0);
 
-  row << '\n';
-  state->stream << row.str();
+  // append per-foot target joint and target vector (if available)
+  double* foot_pos[ResidualFn::kNumFoot];
+  for (ResidualFn::A1Foot f : ResidualFn::kFootAll) foot_pos[f] = data->geom_xpos + 3 * foot_geom_id_[f];
+  for (int foot = 0; foot < 4; ++foot) {
+    // we do not store per-foot selected joint index directly in state, so
+    // try to infer joint by proximity to hip/knee anchors where possible.
+    int sel = -1;
+    double tx = filtered_target_proj_[foot][0];
+    double ty = filtered_target_proj_[foot][1];
+    double tz = filtered_target_proj_[foot][2];
+    // attempt to determine joint if filtered target exists and we can compute plane
+    double filtered_norm = mju_norm3(filtered_target_proj_[foot]);
+    if (filtered_norm > kPlaneProjectionEps) {
+      PlaneData plane;
+      FootContactInfo info = contact_info[foot];
+      if (ComputePlaneData(data, foot_pos[foot], info, hip_joint_id_[foot], knee_joint_id_[foot], &plane)) {
+        double hip_vec[3]; mju_sub3(hip_vec, plane.hip_anchor, plane.foot_point);
+        double knee_vec[3]; mju_sub3(knee_vec, plane.knee_anchor, plane.foot_point);
+        double hip_proj[3], knee_proj[3];
+        ProjectOntoPlane(hip_proj, hip_vec, plane.plane_normal);
+        ProjectOntoPlane(knee_proj, knee_vec, plane.plane_normal);
+        double dhip_vec[3], dknee_vec[3];
+        mju_sub3(dhip_vec, filtered_target_proj_[foot], hip_proj);
+        mju_sub3(dknee_vec, filtered_target_proj_[foot], knee_proj);
+        double dhip = mju_norm3(dhip_vec), dknee = mju_norm3(dknee_vec);
+        if (dhip + dknee > 0.0) sel = (dhip <= dknee) ? 0 : 1;
+      }
+    }
+    row << ',' << sel << ',' << tx << ',' << ty << ',' << tz;
+  }
+
+    // append current knob values for post-hoc debugging
+    row << ',' << fixation_weight_ << ',' << power_penalty_weight_
+      << ',' << target_smooth_tau_ << ',' << target_blend_alpha_;
+    row << ',' << grf_weight_default_;
+    for (int i = 0; i < 4; ++i) row << ',' << grf_per_foot_scale_[i];
+    row << ',' << internal_grf_align_weight_;
+    row << ',' << static_cast<int>(current_mode_) << ',' << static_cast<int>(current_gait_);
+    row << '\n';
+    state->stream << row.str();
   state->last_time = t;
 }
 
@@ -387,11 +524,104 @@ std::string QuadrupedFlatMod::XmlPath() const {
 std::string QuadrupedHillMod::Name() const { return "Quadruped Hill (mod)"; }
 std::string QuadrupedFlatMod::Name() const { return "Quadruped Flat (mod)"; }
 
+// Static wrappers exposed through the ResidualFn class for unit testing.
+QuadrupedFlatMod::ResidualFn::MotorSelectionTestResult
+QuadrupedFlatMod::ResidualFn::SelectMotorUsingNormalForTest(
+    const double contact_normal[3], const double motor_vectors[2][3],
+    const double plane_normal[3], double blend_beta) {
+  MotorSelectionResult res =
+      SelectMotorUsingNormal(contact_normal, motor_vectors, plane_normal,
+                             blend_beta);
+  MotorSelectionTestResult out;
+  out.valid = (res.index >= 0) || (mju_norm3(res.motor_proj) > 0.0);
+  out.index = res.index;
+  out.angle = res.angle;
+  mju_copy3(out.motor_proj, res.motor_proj);
+  mju_copy3(out.normal_proj, res.normal_proj);
+  return out;
+}
+
+bool QuadrupedFlatMod::ResidualFn::ComputePlaneFromPointsForTest(
+    const double hip_anchor[3], const double knee_anchor[3],
+    const double foot_point[3], double plane_normal_out[3]) {
+  return ComputePlaneFromPoints(hip_anchor, knee_anchor, foot_point,
+                                plane_normal_out);
+}
+
+bool QuadrupedFlatMod::ResidualFn::ComputePerFootResidualForTest(
+    const double foot_force[3], const double contact_normal[3],
+    const double hip_anchor[3], const double knee_anchor[3],
+    const double foot_point[3], double grf_weight, double out_res[3]) {
+  PlaneData plane;
+  // build a minimal FootContactInfo for plane computation
+  FootContactInfo info;
+  mju_copy3(info.force, foot_force);
+  mju_copy3(info.normal, contact_normal);
+  mju_copy3(info.point, foot_point);
+  // Use ComputePlaneFromPoints to validate and get plane normal
+  double plane_normal[3];
+  if (!ComputePlaneFromPoints(hip_anchor, knee_anchor, foot_point, plane_normal)) {
+    return false;
+  }
+  double motor_vectors[2][3];
+  mju_sub3(motor_vectors[0], hip_anchor, foot_point);
+  mju_sub3(motor_vectors[1], knee_anchor, foot_point);
+
+  MotorSelectionResult sel = SelectMotorUsingNormal(contact_normal, motor_vectors,
+                                                   plane_normal, /*blend*/ 0.0);
+  if (sel.index < 0) return false;
+
+  double grf_proj[3];
+  ProjectOntoPlane(grf_proj, foot_force, plane_normal);
+  double diff[3];
+  mju_sub3(diff, grf_proj, sel.motor_proj);
+  // scale residual by sqrt(grf_weight)
+  double scl = grf_weight > 0.0 ? std::sqrt(grf_weight) : 0.0;
+  mju_copy3(out_res, diff);
+  mju_scl3(out_res, out_res, scl);
+  return true;
+}
+
 void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
                                             const mjData* data,
                                             double* residual) const {
   // start counter
   int counter = 0;
+
+  // --- Conservative, task-local control clipping ---
+  // To avoid changing baseline behavior, mod-specific control sanitization
+  // is performed here (only for the modified quadruped task). This prevents
+  // NaN/Inf/huge values from destabilizing the simulation during early steps
+  // in experiments. The clip can be overridden via MJPC_CTRL_CLIP.
+  static bool _ctrl_clip_init = false;
+  static double _ctrl_clip_val = 100.0;
+  if (!_ctrl_clip_init) {
+    const char* env = std::getenv("MJPC_CTRL_CLIP");
+    if (env && *env) {
+      try {
+        _ctrl_clip_val = std::stod(env);
+      } catch (...) {
+        _ctrl_clip_val = 100.0;
+      }
+    }
+    _ctrl_clip_init = true;
+  }
+  for (int j = 0; j < model->nu; ++j) {
+    // sanitize NaNs/Infs
+    if (!std::isfinite(data->ctrl[j])) data->ctrl[j] = 0.0;
+    double lo = -_ctrl_clip_val;
+    double hi = _ctrl_clip_val;
+    if (model->actuator_ctrlrange) {
+      double rlo = model->actuator_ctrlrange[2*j];
+      double rhi = model->actuator_ctrlrange[2*j + 1];
+      if (std::isfinite(rlo) && std::isfinite(rhi) && rhi > rlo) {
+        lo = rlo;
+        hi = rhi;
+      }
+    }
+    if (data->ctrl[j] < lo) data->ctrl[j] = lo;
+    else if (data->ctrl[j] > hi) data->ctrl[j] = hi;
+  }
 
   // get foot positions
   double* foot_pos[kNumFoot];
@@ -519,7 +749,22 @@ void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
 
 
   // ---------- Effort ----------
-  mju_scl(residual + counter, data->actuator_force, 2e-2, model->nu);
+  // Effort residuals (base) + optional power penalty fused here for stability.
+  for (int i = 0; i < model->nu; ++i) {
+    double applied = data->actuator_force[i];
+    double base = 2e-2 * applied;
+    double qvel = 0.0;
+    int joint_id = model->actuator_trnid[2*i];
+    if (joint_id >= 0) {
+      int dof_adr = model->jnt_dofadr[joint_id];
+      if (dof_adr >= 0) qvel = data->qvel[dof_adr];
+    }
+    double power_term = 0.0;
+    if (power_penalty_weight_ > 0.0) {
+      power_term = std::sqrt(power_penalty_weight_) * (applied * qvel);
+    }
+    residual[counter + i] = base + power_term;
+  }
   counter += model->nu;
 
 
@@ -560,6 +805,25 @@ void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
       residual[counter + 3] *= arm_posture;
       residual[counter + 4] *= arm_posture;
       residual[counter + 5] *= arm_posture;
+    }
+  }
+  // Add fixation penalty to posture residual block (blend-in qvel penalty)
+  if (fixation_weight_ > 0.0) {
+    for (A1Foot foot : kFootAll) {
+      for (int joint = 0; joint < 3; ++joint) {
+        // map joint index within posture block: index = counter + 3*foot + joint
+        int idx = counter + 3*foot + joint;
+        int model_joint_id = -1;
+        if (joint == 0) model_joint_id = abduction_joint_id_[foot];
+        else if (joint == 1) model_joint_id = hip_joint_id_[foot];
+        else model_joint_id = knee_joint_id_[foot];
+        double qvel = 0.0;
+        if (model_joint_id >= 0) {
+          int dof_adr = model->jnt_dofadr[model_joint_id];
+          if (dof_adr >= 0) qvel = data->qvel[dof_adr];
+        }
+        residual[idx] += std::sqrt(fixation_weight_) * qvel;
+      }
     }
   }
   counter += model->nu;
@@ -702,53 +966,17 @@ void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
   mju_copy(residual + counter, net_residual, 3);
   counter += 3;
 
-  // ---------- Internal Force Alignment (Kuznetsov) ----------
-  // Added to GRF cost as an improvement.
-  // Penalize forces that deviate from the optimal plane defined by hip/knee.
-  // Alignment weight is driven by the internal flag and scaled by transition boost.
-  double kAlignmentWeight = internal_grf_align_weight_ * grf_transition_boost_;
-  constexpr int kContactStableSteps = 5;
-  for (A1Foot foot : kFootAll) {
-    double alignment_residual[3] = {0.0, 0.0, 0.0};
-    FootContactInfo& info = contact_info[foot];
-    
-    if (info.in_contact && contact_streak_[foot] >= kContactStableSteps) {
-        PlaneData plane;
-        if (ComputePlaneData(data, foot_pos[foot], info, hip_joint_id_[foot],
-                             knee_joint_id_[foot], &plane)) {
-            
-            double motor_vectors[2][3];
-            mju_sub3(motor_vectors[0], plane.hip_anchor, plane.foot_point);
-            mju_sub3(motor_vectors[1], plane.knee_anchor, plane.foot_point);
-            
-            double contact_normal[3];
-            mju_copy3(contact_normal, info.normal);
-            
-            MotorSelectionResult selection =
-                SelectMotorUsingNormal(contact_normal, motor_vectors, plane.plane_normal);
-                
-            if (selection.index >= 0) { 
-                 double optimal_dir[3];
-                 mju_copy3(optimal_dir, selection.motor_proj);
-                 mju_normalize(optimal_dir, 3);
-                 
-                 double force_dir[3];
-                 mju_copy3(force_dir, info.force);
-                 double force_mag = mju_normalize(force_dir, 3);
-                 
-                 // Penalize misalignment (cross product)
-                 // Reverted to quadratic cost (proportional to force_mag)
-                 if (force_mag > 1.0) { 
-                     double cross[3];
-                     mju_cross(cross, force_dir, optimal_dir);
-                     // Scale down the residual to avoid overpowering the net GRF cost
-                     mju_scl3(alignment_residual, cross, force_mag * kAlignmentWeight); 
-                 }
-            }
-        }
-    }
-    mju_copy(residual + counter, alignment_residual, 3);
-    counter += 3;
+  // Placeholder: reserve 3 residuals per foot for historical per-foot
+  // alignment entries so that sensor/user-sensor dimensions remain
+  // consistent with the XML model. These are set to zero for now to
+  // avoid double-penalizing while we experiment with the scalar
+  // hind/front alignment costs below.
+  // remember base index so we can fill with per-foot residuals later
+  int perfoot_res_base = counter;
+  for (int i = 0; i < kNumFoot; ++i) {
+    residual[counter++] = 0.0;
+    residual[counter++] = 0.0;
+    residual[counter++] = 0.0;
   }
 
   // Reset filters when simulation time jumps backwards (e.g. reset).
@@ -778,6 +1006,10 @@ void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
     }
   }
 
+  // ---------- MOD: Kuznetsov-style per-foot GRF alignment ----------
+  // This block implements the per-hind/per-front reference generation,
+  // motor selection and gating logic introduced in the 'mod' variant.
+  // Keep related code together for easier inspection and testing.
   // ---------- Hind leg GRF alignment ----------
   double hind_alignment[2] = {0.0, 0.0};
   double front_alignment[2] = {0.0, 0.0};
@@ -790,7 +1022,7 @@ void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
   for (A1Foot foot : kFootAll) {
     const FootContactInfo& info = contact_info[foot];
     if ((foot == kFootHL || foot == kFootHR) && info.in_contact &&
-        contact_streak_[foot] >= kContactStableSteps) {
+        contact_streak_[foot] >= contact_stable_steps_) {
       hind_contact_count++;
     }
   }
@@ -799,7 +1031,7 @@ void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
   for (int hind_idx = 0; hind_idx < 2; ++hind_idx) {
     A1Foot foot = kFootHind[hind_idx];
     FootContactInfo& info = contact_info[foot];
-    if (!info.in_contact || contact_streak_[foot] < kContactStableSteps) {
+    if (!info.in_contact || contact_streak_[foot] < contact_stable_steps_) {
       // Only the hind-left foot contributes to the alignment cost.
       hind_alignment[hind_idx] = 0.0;
       continue;
@@ -825,7 +1057,8 @@ void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
     mju_copy3(contact_normal, info.normal);
 
     MotorSelectionResult selection =
-        SelectMotorUsingNormal(contact_normal, motor_vectors, plane_normal);
+      SelectMotorUsingNormal(contact_normal, motor_vectors, plane_normal,
+                   grf_motor_blend_beta_);
     if (selection.index < 0) {
       hind_alignment[hind_idx] = 0.0;
       continue;
@@ -899,8 +1132,32 @@ void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
                      mju_dot3(grf_proj, grf_proj);
     hind_alignment[hind_idx] = mju_sqrt(cost_val);
 
+    // Fill per-foot residual (vector) for hind foot. Scale by sqrt(weight)
+    // so that 0.5 * ||res||^2 ~= weight * 0.5 * ||diff||^2.
+    double scale = std::max(0.0, grf_hind_weight_);
+    double scale_sqrt = std::sqrt(scale);
+    double perfoot_scaled[3];
+    mju_copy3(perfoot_scaled, diff);
+    mju_scl3(perfoot_scaled, perfoot_scaled, scale_sqrt);
+    // NOTE: runtime GRF sensor scaling intentionally disabled — use raw
+    // measured GRF to avoid masking true energy effects.
+    for (int j = 0; j < 3; ++j) {
+      residual[perfoot_res_base + 3 * foot + j] = perfoot_scaled[j];
+    }
+
     hind_reference_valid[hind_idx] = true;
     mju_copy3(hind_reference_vectors[hind_idx], selection.motor_proj);
+  }
+
+  // Apply hardcoded scaling to hind alignment residuals so the optimizer
+  // is influenced even if model weights are not yet tuned. This is a
+  // temporary measure for quick experiments.
+  for (int i = 0; i < 2; ++i) {
+    hind_alignment[i] *= grf_hind_weight_;
+  }
+  // Scale front alignment by its configured weight as well.
+  for (int i = 0; i < 2; ++i) {
+    front_alignment[i] *= grf_front_weight_;
   }
 
   // ---------- Front leg GRF alignment (mirrored reference) ----------
@@ -909,7 +1166,7 @@ void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
   int front_contact_count = 0;
   for (A1Foot foot : kFootAll) {
     if ((foot == kFootFL || foot == kFootFR) && contact_info[foot].in_contact &&
-        contact_streak_[foot] >= kContactStableSteps &&
+        contact_streak_[foot] >= contact_stable_steps_ &&
         contact_info[foot].force[2] >= min_contact_fz) {
       front_contact_count++;
     }
@@ -919,7 +1176,7 @@ void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
   for (int front_idx = 0; front_idx < 2; ++front_idx) {
     A1Foot foot = kFrontFeet[front_idx];
     FootContactInfo& info = contact_info[foot];
-    if (!info.in_contact || contact_streak_[foot] < kContactStableSteps) {
+    if (!info.in_contact || contact_streak_[foot] < contact_stable_steps_) {
       front_alignment[front_idx] = 0.0;
       continue;
     }
@@ -967,6 +1224,18 @@ void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
       (0.5 * diff_norm * diff_norm +
        0.5 * kGrfMagnitudeWeight * mju_dot3(grf_proj, grf_proj));
     front_alignment[front_idx] = mju_sqrt(cost_val);
+
+    // Fill per-foot residual (vector) for front foot (vertical-only diff is
+    // already enforced). Scale with mirror weight and front weight so the
+    // squared residual norm matches the intended contribution.
+    double scale = std::max(0.0, grf_front_weight_) * kFrontMirrorWeight;
+    double scale_sqrt = std::sqrt(scale);
+    double perfoot_scaled[3];
+    mju_copy3(perfoot_scaled, diff);
+    mju_scl3(perfoot_scaled, perfoot_scaled, scale_sqrt);
+    for (int j = 0; j < 3; ++j) {
+      residual[perfoot_res_base + 3 * foot + j] = perfoot_scaled[j];
+    }
   }
 
   bool debug_enabled =
@@ -1149,7 +1418,7 @@ void QuadrupedFlatMod::TransitionLocked(mjModel* model, mjData* data) {
     parameters[residual_.amplitude_param_id_] = ResidualFn::kGaitParam[gait][2];
     weight[residual_.balance_cost_id_] = ResidualFn::kGaitParam[gait][3];
     weight[residual_.upright_cost_id_] = ResidualFn::kGaitParam[gait][4];
-    weight[residual_.height_cost_id_] = ResidualFn::kGaitParam[gait][5];
+    weight[residual_.height_cost_id_] = ResidualFn::kGaitParam[gait][5] * residual_.height_weight_scale_;
     if (residual_.grf_cost_id_ >= 0) {
       weight[residual_.grf_cost_id_] = residual_.grf_weight_default_;
     }
@@ -1423,7 +1692,7 @@ void QuadrupedFlatMod::ModifyScene(const mjModel* model, const mjData* data,
       front_force_z += info.force[2];
     }
   }
-  double target_hind_total_z = expected_contact[2] - front_force_z;
+  // target_hind_total_z unused; omit computation for now
 
   for (int hind_idx = 0; hind_idx < 2; ++hind_idx) {
     ResidualFn::A1Foot foot = ResidualFn::kFootHind[hind_idx];
@@ -1449,7 +1718,8 @@ void QuadrupedFlatMod::ModifyScene(const mjModel* model, const mjData* data,
     mju_copy3(contact_normal, info.normal);
 
     MotorSelectionResult selection =
-        SelectMotorUsingNormal(contact_normal, motor_vectors, plane.plane_normal);
+      SelectMotorUsingNormal(contact_normal, motor_vectors, plane.plane_normal,
+                   residual_.grf_motor_blend_beta_);
     if (selection.index < 0) {
       continue;
     }
@@ -1463,37 +1733,50 @@ void QuadrupedFlatMod::ModifyScene(const mjModel* model, const mjData* data,
     mju_copy3(motor_dir, selection.motor_proj);
     mju_scl3(motor_dir, motor_dir, 1.0 / motor_proj_norm);
 
-    double share;
-    if (hind_force_positive_sum >= kPlaneProjectionEps) {
-      share = mju_max(info.force[2], 0.0) / hind_force_positive_sum;
-    } else if (hind_contact_count > 0) {
-      share = 1.0 / hind_contact_count;
-    } else {
-      share = 0.0;
-    }
-    double target_leg_z = share * target_hind_total_z;
-
-    double desired_scale = motor_proj_norm;
-    double dir_z = motor_dir[2];
-    if (std::abs(dir_z) >= kPlaneProjectionEps) {
-      double candidate_scale = target_leg_z / dir_z;
-      if (candidate_scale >= 0.0) {
-        desired_scale = candidate_scale;
-      } else {
-        desired_scale = 0.0;
-      }
-    }
+    // --- Kuznetsov target joint selection ---
+    // compute candidate target vector(s) from foot contact point to anatomical anchors
+    double hip_vec[3]; mju_sub3(hip_vec, plane.hip_anchor, plane.foot_point);
+    double knee_vec[3]; mju_sub3(knee_vec, plane.knee_anchor, plane.foot_point);
+    double vertical[3] = {0.0, 0.0, 1.0};
+    double theta_hip = AngleBetween(hip_vec, vertical);
+    double theta_knee = AngleBetween(knee_vec, vertical);
+    int selected_joint = (std::abs(theta_hip) <= std::abs(theta_knee)) ? 0 : 1; // 0=hip,1=knee
 
     double target_proj[3];
-    mju_copy3(target_proj, motor_dir);
-    mju_scl3(target_proj, target_proj, desired_scale);
+    if (residual_.grf_target_mode_ == "kuznetsov") {
+      // project chosen anchor onto plane
+      if (selected_joint == 0) ProjectOntoPlane(target_proj, hip_vec, plane.plane_normal);
+      else ProjectOntoPlane(target_proj, knee_vec, plane.plane_normal);
+    } else if (residual_.grf_target_mode_ == "alexander") {
+      // Alexander's point approximate: use hip anchor as a fixed 'above' reference
+      ProjectOntoPlane(target_proj, hip_vec, plane.plane_normal);
+    } else { // blend
+      ProjectOntoPlane(target_proj, hip_vec, plane.plane_normal);
+      double tmp[3]; ProjectOntoPlane(tmp, knee_vec, plane.plane_normal);
+      for (int j=0;j<3;++j) target_proj[j] = (1.0 - residual_.target_blend_alpha_) * target_proj[j] + residual_.target_blend_alpha_ * tmp[j];
+    }
 
-    mju_copy3(selection.motor_proj, target_proj);
+    // blend between motor-derived projection and target projection
+    double final_ref[3];
+    for (int j=0;j<3;++j) final_ref[j] = (1.0 - residual_.target_blend_alpha_) * selection.motor_proj[j] + residual_.target_blend_alpha_ * target_proj[j];
 
+    // smoothing with configurable tau
+    double dt = 0.0;
+    if (std::isfinite(residual_.last_filter_time_)) dt = data->time - residual_.last_filter_time_;
+    double alpha = 0.2; // default
+    if (residual_.target_smooth_tau_ > 0.0 && dt > 0.0) alpha = dt / (residual_.target_smooth_tau_ + dt);
+    for (int j=0;j<3;++j) {
+      residual_.filtered_target_proj_[foot][j] = (1.0 - alpha) * residual_.filtered_target_proj_[foot][j] + alpha * final_ref[j];
+    }
+
+    // we now use filtered_target_proj_ as the selection.motor_proj analog
+    mju_copy3(selection.motor_proj, residual_.filtered_target_proj_[foot]);
+
+    // Use the filtered target directly as the hind reference vector.
     hind_reference_valid[hind_idx] = true;
     hind_selection_valid[hind_idx] = true;
     hind_selection_data[hind_idx] = selection;
-    mju_copy3(hind_reference_vectors[hind_idx], target_proj);
+    mju_copy3(hind_reference_vectors[hind_idx], residual_.filtered_target_proj_[foot]);
   }
 
   constexpr ResidualFn::A1Foot kFrontFeet[2] = {ResidualFn::kFootFront[0],
@@ -1525,12 +1808,25 @@ void QuadrupedFlatMod::ModifyScene(const mjModel* model, const mjData* data,
     double mirrored_ref[3] = {-hind_reference_vectors[diag_idx][0],
                               -hind_reference_vectors[diag_idx][1],
                                hind_reference_vectors[diag_idx][2]};
+    // Optionally nudge mirrored front reference by a scaled negative net force
+    // to encourage the net GRF to approach [0,0,mg] when reflect gain > 0.
+    if (residual_.reflect_net_force_gain_ > 0.0) {
+      double reflect[3];
+      mju_copy3(reflect, net_force);
+      mju_scl3(reflect, reflect, -residual_.reflect_net_force_gain_);
+      mju_addTo3(mirrored_ref, reflect);
+    }
     double reference_proj[3];
     ProjectOntoPlane(reference_proj, mirrored_ref, plane.plane_normal);
 
     front_reference_valid[front_idx] = true;
     mju_copy3(front_reference_vectors[front_idx], reference_proj);
   }
+
+  // (Front alignment scaling is applied in Residual path; visualizer does not
+  // scale here to keep visualisation neutral.)
+
+  // ---------- END MOD: Kuznetsov-style per-foot GRF alignment ----------
 
   // stance and flight positions
   double flight_pos[ResidualFn::kNumFoot][3];
@@ -1830,6 +2126,53 @@ void QuadrupedFlatMod::ModifyScene(const mjModel* model, const mjData* data,
 // save task-related ids
 void QuadrupedFlatMod::ResetLocked(const mjModel* model) {
   (void)model;
+  // Ensure sensible default experiment env vars are present so running the
+  // task without explicit overrides yields reproducible quick-check
+  // behaviour (matches `scripts/sweep_target_smoothing.py` defaults).
+  auto set_default = [](const char* name, const char* val) {
+    if (!std::getenv(name)) {
+      // don't overwrite existing values; set only when absent
+      setenv(name, val, 0);
+    }
+  };
+  set_default("MJPC_CSV_LOG", "logs/quadruped_log.csv");
+  set_default("MJPC_MAX_SIM_TIME", "60");
+  set_default("MJPC_SEED", "1");
+
+  // Cost / penalty defaults
+  set_default("MJPC_GRF_WEIGHT", "1e-5");
+  set_default("MJPC_GRF_PER_FOOT_SCALE", "0.8,0.8,1.2,1.2");
+  set_default("MJPC_GRF_HIND_WEIGHT", "1e-7");
+  set_default("MJPC_GRF_FRONT_WEIGHT", "1e-7");
+  set_default("MJPC_INTERNAL_GRF_ALIGN_WEIGHT", "1e-3");
+  set_default("MJPC_TARGET_SMOOTH_TAU", "1.0");
+  set_default("MJPC_TARGET_BLEND_ALPHA", "0.6");
+  set_default("MJPC_FIXATION_WEIGHT", "1e-4");
+  set_default("MJPC_POWER_PENALTY_WEIGHT", "0");
+  set_default("MJPC_POWER_PENALTY_MODE", "");
+  set_default("MJPC_HEIGHT_WEIGHT_SCALE", "1.0");
+  set_default("MJPC_BIARTICULAR_GAIN", "0.0");
+
+  // GRF control / misc
+  set_default("MJPC_GRF_TRANSITION_BOOST", "0.0");
+  set_default("MJPC_GRF_NORMALIZE", "0");
+  set_default("MJPC_GRF_LOSS_MIX", "0.0");
+  set_default("MJPC_GRF_MOTOR_BLEND", "0.0");
+  set_default("MJPC_DISABLE_MOTOR_BLEND", "0");
+  set_default("MJPC_GRF_TARGET_MODE", "");
+
+  // Simulation / stability controls
+  set_default("MJPC_CONTACT_STABLE_STEPS", "10");
+  set_default("MJPC_CTRL_CLIP", "100");
+  set_default("MJPC_MIN_TRAVEL_DISTANCE_M", "0");
+
+  // Sensor / debugging (advanced)
+  set_default("MJPC_GRF_SENSOR_SCALE", "1.0");
+  set_default("MJPC_REFLECT_NET_FORCE_GAIN", "0.0");
+
+  // Metrics (post-processing helpers)
+  set_default("MJPC_METRICS_START_SEC", "");
+  set_default("MJPC_METRICS_END_SEC", "");
   // ----------  task identifiers  ----------
   residual_.gait_param_id_ = ParameterIndex(model, "select_Gait");
   (void)residual_.gait_param_id_;
@@ -1881,6 +2224,38 @@ void QuadrupedFlatMod::ResetLocked(const mjModel* model) {
     }
   }
 
+  // Optional mass distribution override (comma-separated 4 values: FL, HL, FR, HR).
+  // Values are normalized to mean=1 so the total mass is preserved.
+  if (const char* envmd = std::getenv("MJPC_MASS_DISTRIBUTION")) {
+    std::string s(envmd);
+    std::vector<double> vals2;
+    size_t start2 = 0;
+    while (start2 < s.size()) {
+      size_t pos2 = s.find(',', start2);
+      std::string tok = (pos2 == std::string::npos) ? s.substr(start2) : s.substr(start2, pos2 - start2);
+      try { vals2.push_back(std::stod(tok)); } catch(...) { vals2.push_back(1.0); }
+      if (pos2 == std::string::npos) break;
+      start2 = pos2 + 1;
+    }
+    if (vals2.size() == 4) {
+      double mean = 0.0;
+      for (double v : vals2) mean += v;
+      mean /= 4.0;
+      if (mean <= 0.0) mean = 1.0;
+      for (size_t i = 0; i < 4; ++i) residual_.grf_per_foot_scale_[i] = vals2[i] / mean;
+    }
+  }
+
+  // New knobs for target-mode, smoothing, fixation and power penalties
+  if (const char* env_tm = std::getenv("MJPC_GRF_TARGET_MODE")) residual_.grf_target_mode_ = std::string(env_tm);
+  if (const char* env_tba = std::getenv("MJPC_TARGET_BLEND_ALPHA")) try { residual_.target_blend_alpha_ = std::stod(std::string(env_tba)); } catch(...) {}
+  if (const char* env_tau = std::getenv("MJPC_TARGET_SMOOTH_TAU")) try { residual_.target_smooth_tau_ = std::stod(std::string(env_tau)); } catch(...) {}
+  if (const char* env_fix = std::getenv("MJPC_FIXATION_WEIGHT")) try { residual_.fixation_weight_ = std::stod(std::string(env_fix)); } catch(...) {}
+  if (const char* env_ppw = std::getenv("MJPC_POWER_PENALTY_WEIGHT")) try { residual_.power_penalty_weight_ = std::stod(std::string(env_ppw)); } catch(...) {}
+  if (const char* env_ppm = std::getenv("MJPC_POWER_PENALTY_MODE")) residual_.power_penalty_mode_ = std::string(env_ppm);
+  if (const char* env_hws = std::getenv("MJPC_HEIGHT_WEIGHT_SCALE")) try { residual_.height_weight_scale_ = std::stod(std::string(env_hws)); } catch(...) {}
+  if (const char* env_bi = std::getenv("MJPC_BIARTICULAR_GAIN")) try { residual_.biarticular_gain_ = std::stod(std::string(env_bi)); } catch(...) {}
+
   if (const char* envt = std::getenv("MJPC_GRF_TRANSITION_BOOST")) {
     try { residual_.grf_transition_boost_ = std::stod(std::string(envt)); } catch(...) {}
   }
@@ -1892,6 +2267,42 @@ void QuadrupedFlatMod::ResetLocked(const mjModel* model) {
   }
   if (const char* envlm = std::getenv("MJPC_GRF_LOSS_MIX")) {
     try { residual_.grf_loss_mix_ = std::stod(std::string(envlm)); } catch(...) { residual_.grf_loss_mix_ = 0.0; }
+  }
+
+  // Motor selection blending: optional softmax blending beta (>0 enables blending)
+  if (const char* envmb = std::getenv("MJPC_GRF_MOTOR_BLEND")) {
+    try { residual_.grf_motor_blend_beta_ = std::stod(std::string(envmb)); } catch(...) { residual_.grf_motor_blend_beta_ = 0.0; }
+  }
+  // Disable motor blend if explicitly requested.
+  if (const char* envdmb = std::getenv("MJPC_DISABLE_MOTOR_BLEND")) {
+    std::string v(envdmb);
+    if (v == "1" || v == "true" || v == "True") residual_.grf_motor_blend_beta_ = 0.0;
+  }
+  // Optional scalar to set both hind and front GRF weights to the same value.
+  if (const char* envgw = std::getenv("MJPC_GRF_WEIGHT")) {
+    try {
+      double gw = std::stod(std::string(envgw));
+      residual_.grf_hind_weight_ = gw;
+      residual_.grf_front_weight_ = gw;
+      residual_.use_xml_grf_weight_ = true;
+    } catch(...) {}
+  }
+  // Hardcoded testing weights for Kuznetsov per-foot costs (overridable by env)
+  if (const char* envhh = std::getenv("MJPC_GRF_HIND_WEIGHT")) {
+    try { residual_.grf_hind_weight_ = std::stod(std::string(envhh)); } catch(...) {}
+  }
+  if (const char* envfh = std::getenv("MJPC_GRF_FRONT_WEIGHT")) {
+    try { residual_.grf_front_weight_ = std::stod(std::string(envfh)); } catch(...) {}
+  }
+
+  // contact stability override
+  if (const char* envcs = std::getenv("MJPC_CONTACT_STABLE_STEPS")) {
+    try { residual_.contact_stable_steps_ = std::stoi(std::string(envcs)); } catch(...) { residual_.contact_stable_steps_ = kContactStableSteps; }
+  }
+
+  // optional net-force reflection gain (nudges mirrored front refs using -net_force)
+  if (const char* envrf = std::getenv("MJPC_REFLECT_NET_FORCE_GAIN")) {
+    try { residual_.reflect_net_force_gain_ = std::stod(std::string(envrf)); } catch(...) { residual_.reflect_net_force_gain_ = 0.0; }
   }
 
   // Cache internal alignment weight (can be overridden by environment variable)
@@ -1978,15 +2389,6 @@ void QuadrupedFlatMod::ResetLocked(const mjModel* model) {
     residual_.total_mass_ += model->body_mass[i];
   }
   (void)residual_.total_mass_;
-
-  // // стартовый режим по умолчанию — Quadruped / Stand (статичная стойка)
-  // mode = ResidualFn::kModeQuadruped;
-  // residual_.current_mode_ = ResidualFn::kModeQuadruped;
-  // if (residual_.gait_param_id_ >= 0 &&
-  //     residual_.gait_param_id_ < parameters.size()) {
-  //   parameters[residual_.gait_param_id_] =
-  //       ReinterpretAsDouble(ResidualFn::kGaitStand);
-  // }
 
   // ----------  derived kinematic quantities for Flip  ----------
   residual_.gravity_ = mju_norm3(model->opt.gravity);

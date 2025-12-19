@@ -17,3 +17,12 @@ target_link_libraries(task_test load gmock libtestspeed)
 
 test(quadruped_stability_test)
 target_link_libraries(quadruped_stability_test gmock load libtestspeed)
+
+test(motor_selection_test)
+target_link_libraries(motor_selection_test gmock load libtestspeed)
+
+test(plane_test)
+target_link_libraries(plane_test gmock load libtestspeed)
+
+test(perfoot_residual_test)
+target_link_libraries(perfoot_residual_test gmock load libtestspeed)

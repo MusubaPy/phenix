@@ -216,13 +216,71 @@ class QuadrupedFlatMod : public Task {
     double save_gait_switch_  = 0;
     std::vector<double> save_weight_;
 
-    // GRF tuning parameters (can be set from env vars in ResetLocked)
-    double grf_per_foot_scale_[4] = {1.0, 1.0, 1.0, 1.0};
+    // === MOD: GRF tuning parameters (set via env vars in ResetLocked) ===
+    // The following fields are the core experimental knobs introduced in
+    // the 'mod' task. Keep them grouped to simplify audits and sweeps.
+    // Env variables: MJPC_GRF_PER_FOOT_SCALE, MJPC_MASS_DISTRIBUTION,
+    // MJPC_GRF_WEIGHT, MJPC_GRF_HIND_WEIGHT, MJPC_GRF_FRONT_WEIGHT,
+    // MJPC_GRF_MOTOR_BLEND, MJPC_DISABLE_MOTOR_BLEND,
+    // MJPC_CONTACT_STABLE_STEPS, MJPC_REFLECT_NET_FORCE_GAIN
+    // Default per-foot GRF scaling (match sweep defaults used by scripts).
+    double grf_per_foot_scale_[4] = {0.8, 0.8, 1.2, 1.2};
     bool grf_normalize_ = false;
     double grf_loss_mix_ = 0.0;
-    double grf_transition_boost_ = 1.0;
+    // Default: no transition boost for quick checks.
+    double grf_transition_boost_ = 0.0;
     double internal_grf_align_weight_ = 0.001;
+      // Target joint selection / Kuznetsov mode parameters
+      // MJPC_GRF_TARGET_MODE: kuznetsov | alexander | blend
+      std::string grf_target_mode_ = "kuznetsov";
+      // Defaults chosen to match the quick-check smoothing candidate
+      // (tau=1.0, alpha=0.6) used by our sweep scripts.
+      double target_blend_alpha_ = 0.6;  // MJPC_TARGET_BLEND_ALPHA
+      double target_smooth_tau_ = 1.0;   // MJPC_TARGET_SMOOTH_TAU (seconds)
 
+      // Joint fixation penalty
+      // Default fixation weight used for quick checks (small, non-zero).
+      double fixation_weight_ = 1e-4;     // MJPC_FIXATION_WEIGHT
+      double fixation_threshold_ = 0.0;  // MJPC_FIXATION_THRESHOLD (unused: future)
+
+      // Power penalty (p = torque * joint_vel). Value added into effort residuals
+      double power_penalty_weight_ = 0.0;  // MJPC_POWER_PENALTY_WEIGHT
+      std::string power_penalty_mode_ = "l2"; // 'l2' or 'l1'
+      // scaling knob to amplify the built-in Height cost (1.0 = no change)
+      double height_weight_scale_ = 1.0;  // MJPC_HEIGHT_WEIGHT_SCALE
+
+      // Optional biarticular coupling gain (experimental)
+      double biarticular_gain_ = 0.0;    // MJPC_BIARTICULAR_GAIN
+      // motor selection blending beta (softmax). >0 enables blending
+      double grf_motor_blend_beta_ = 0.0;
+    // contact stability steps (can be overridden via env MJPC_CONTACT_STABLE_STEPS)
+    // Default contact stability required steps (match sweep default 10).
+    int contact_stable_steps_ = 10;
+    // Hardcoded testing weights for quick validation (can be overridden by env)
+    // Made conservative by default to avoid destabilizing early runs.
+    // Conservative experimental defaults (tiny values so these terms are
+    // effectively inactive unless explicitly increased).
+    double grf_hind_weight_ = 1e-7;   // scale for hind alignment residual
+    double grf_front_weight_ = 1e-7; // scale for front alignment residual
+
+    // NOTE: runtime sensor scaling removed — measured GRF are used as-is.
+    // Historically we allowed scaling measured GRF at runtime (MJPC_GRF_SENSOR_SCALE)
+    // for quick experiments; this was found to mask real energy effects and is
+    // therefore disabled. If you need to re-enable it, add a careful
+    // experiment flag here and document it.
+
+    // contact stability steps overridden/stored in the ResidualFn instance.
+    // (see ResidualFn::contact_stable_steps_)
+
+    // optional net-force reflection gain. If >0, front mirrored references
+    // are nudged by a scaled negative net force to encourage net force -> [0,0,mg].
+    double reflect_net_force_gain_ = 0.0;
+
+    // convenience flag: when MJPC_GRF_WEIGHT is present, both hind/front
+    // weights will be set to that scalar value (see ResetLocked).
+    // Future: support direct reading from XML numeric field when explicitly
+    // requested via MJPC_USE_XML_GRF_WEIGHT.
+    bool use_xml_grf_weight_ = false;
     // gait-related states
     double current_gait_      = kGaitStand;
     double phase_start_       = 0;
@@ -322,6 +380,33 @@ class QuadrupedFlatMod : public Task {
                       const FootContactInfo* contact_info,
                       const double* net_grf,
                       bool measurement_active) const;
+
+    // Testing helpers (exposed for unit tests)
+   public:
+    struct MotorSelectionTestResult {
+      bool valid = false;
+      int index = -1;
+      double angle = 0.0;
+      double motor_proj[3] = {0.0, 0.0, 0.0};
+      double normal_proj[3] = {0.0, 0.0, 0.0};
+    };
+    static MotorSelectionTestResult SelectMotorUsingNormalForTest(
+        const double contact_normal[3], const double motor_vectors[2][3],
+        const double plane_normal[3], double blend_beta = 0.0);
+    static bool ComputePlaneFromPointsForTest(const double hip_anchor[3],
+                                             const double knee_anchor[3],
+                                             const double foot_point[3],
+                                             double plane_normal_out[3]);
+    // Compute per-foot residual (intended for unit tests). Returns true and
+    // writes `out_res` if a meaningful residual could be computed (e.g., for
+    // a hind foot with stable contact); otherwise returns false.
+    static bool ComputePerFootResidualForTest(const double foot_force[3],
+                          const double contact_normal[3],
+                          const double hip_anchor[3],
+                          const double knee_anchor[3],
+                          const double foot_point[3],
+                          double grf_weight,
+                          double out_res[3]);
 
     mutable std::shared_ptr<DebugLogState> debug_log_state_;
     mutable std::shared_ptr<CsvLogState> csv_log_state_ =
