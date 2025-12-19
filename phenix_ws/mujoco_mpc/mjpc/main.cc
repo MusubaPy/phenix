@@ -22,6 +22,8 @@
 #include <mujoco/mujoco.h>
 #include "mjpc/app.h"
 #include "mjpc/tasks/tasks.h"
+// shared utilities
+#include "mjpc/common/csv_logger.h"
 
 ABSL_FLAG(std::string, task, "Quadruped Flat",
           "Which model to load on startup.");
@@ -89,6 +91,16 @@ int main(int argc, char** argv) {
       std::cerr << "  " << tasks[i]->Name() << "\n";
     }
     mju_error("Invalid --task flag.");
+  }
+
+  // Initialize shared CSV logger early so the file (and directories) are
+  // created immediately and reported to the user as an absolute path. We
+  // pass the default path used elsewhere; the logger will prefer the
+  // MJPC_CSV_LOG env var if it is set.
+  try {
+    mjpc::CsvLogger::Instance().Init("logs/quadruped_log.csv");
+  } catch (...) {
+    // best-effort; don't fail startup on logger issues
   }
 
   mjpc::StartApp(tasks, task_id);  // start with quadruped flat

@@ -15,7 +15,6 @@
 #ifndef MJPC_TASKS_QUADRUPED_MOD_QUADRUPED_H_
 #define MJPC_TASKS_QUADRUPED_MOD_QUADRUPED_H_
 
-#include <fstream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -50,9 +49,7 @@ class QuadrupedFlatMod : public Task {
   class ResidualFn : public mjpc::BaseResidualFn {
    public:
   explicit ResidualFn(const QuadrupedFlatMod* task)
-    : mjpc::BaseResidualFn(task),
-      debug_log_state_(std::make_shared<DebugLogState>()),
-      csv_log_state_(std::make_shared<CsvLogState>()) {}
+    : mjpc::BaseResidualFn(task), debug_log_state_(std::make_shared<DebugLogState>()) {}
     ResidualFn(const ResidualFn&) = default;
     void Residual(const mjModel* model, const mjData* data,
                   double* residual) const override;
@@ -262,6 +259,12 @@ class QuadrupedFlatMod : public Task {
     // effectively inactive unless explicitly increased).
     double grf_hind_weight_ = 1e-7;   // scale for hind alignment residual
     double grf_front_weight_ = 1e-7; // scale for front alignment residual
+    // Optional horizontal GRF penalty (default off). Gate carefully; may
+    // destabilize if enabled with large weights.
+    double grf_horiz_weight_ = 0.0;  // MJPC_GRF_HORIZ_WEIGHT
+    // Per-foot maximum residual magnitude to avoid exploding objective
+    // contributions when weights are tuned aggressively.
+    double grf_max_residual_ = 0.5;  // MJPC_GRF_MAX_RESIDUAL (meters or unitless vector norm)
 
     // NOTE: runtime sensor scaling removed — measured GRF are used as-is.
     // Historically we allowed scaling measured GRF at runtime (MJPC_GRF_SENSOR_SCALE)
@@ -362,19 +365,9 @@ class QuadrupedFlatMod : public Task {
       double next_print_time = -std::numeric_limits<double>::infinity();
     };
 
-    // CSV logging state shared across residual copies
-    struct CsvLogState {
-      std::mutex state_mutex;
-      bool stream_ready = false;
-      bool header_written = false;
-      double last_time = -std::numeric_limits<double>::infinity();
-      double energy_abs = 0.0;
-      double energy_signed = 0.0;
-      int energy_reset_count = 0;
-      std::string path = "logs/quadruped_log.csv";
-      std::vector<int> actuator_joint_ids;
-      std::ofstream stream;
-    };
+    // CSV logging is handled by the shared `mjpc::CsvLogger` utility. The
+    // previous per-task CsvLogState has been removed in favor of the single
+    // shared logger to avoid truncation races and lock-order complexity.
 
     void MaybeLogStep(const mjModel* model, const mjData* data,
                       const FootContactInfo* contact_info,
@@ -409,8 +402,6 @@ class QuadrupedFlatMod : public Task {
                           double out_res[3]);
 
     mutable std::shared_ptr<DebugLogState> debug_log_state_;
-    mutable std::shared_ptr<CsvLogState> csv_log_state_ =
-        std::make_shared<CsvLogState>();
   };
 
   QuadrupedFlatMod() : residual_(this) {}

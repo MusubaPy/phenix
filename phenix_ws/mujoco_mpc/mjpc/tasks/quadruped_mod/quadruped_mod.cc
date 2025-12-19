@@ -30,6 +30,7 @@
 #include <mujoco/mujoco.h>
 #include "mjpc/task.h"
 #include "mjpc/utilities.h"
+#include "mjpc/common/csv_logger.h"
 
 namespace {
 using mjpc::FootContactInfo;
@@ -312,53 +313,29 @@ void QuadrupedFlatMod::ResidualFn::MaybeLogStep(
     const FootContactInfo* contact_info, const double* net_grf,
     bool measurement_active) const {
   (void)net_grf;
-  auto state = csv_log_state_;
-  if (!state) return;
-
-  std::unique_lock<std::mutex> lock(state->state_mutex);
-
-  if (!state->stream_ready) {
-    const char* env_path = std::getenv("MJPC_CSV_LOG");
-    if (env_path && *env_path) {
-      state->path = env_path;
-    }
-
-    std::filesystem::path csv_path(state->path);
-    if (csv_path.has_parent_path() && !csv_path.parent_path().empty()) {
-      std::error_code ec;
-      std::filesystem::create_directories(csv_path.parent_path(), ec);
-    }
-
-    state->stream.open(csv_path, std::ios::out | std::ios::trunc);
-    if (!state->stream.is_open()) {
-      return;
-    }
-
-    if (state->actuator_joint_ids.empty()) {
-      state->actuator_joint_ids.resize(model->nu, -1);
-      for (int i = 0; i < model->nu; ++i) {
-        state->actuator_joint_ids[i] = model->actuator_trnid[2 * i];
-      }
-    }
-
-    state->stream_ready = true;
-  }
-
   double t = data->time;
-  if (t <= state->last_time + 1e-9) {
-    return;
-  }
+  // Use shared CsvLogger for timing and file I/O. Read the last recorded
+  // time from the logger (guarded) to compute per-step dt without holding
+  // any task-local lock while performing I/O.
+  using mjpc::CsvLogger;
+  CsvLogger& logger = CsvLogger::Instance();
+  double prev_last_time = logger.GetLastTime();
+  if (t <= prev_last_time + 1e-9) return;
 
-  auto header_name = [](const char* base, const char* name) {
-    if (name && *name) return std::string(base) + name;
-    return std::string(base) + "unnamed";
-  };
+  // helper for naming columns
 
-  if (!state->header_written) {
+  logger.EnsureActuatorIds(model);
+
+  // Build header (mod-specific) and ensure it's written. Energy/phase will be appended by logger.
+  {
     std::ostringstream hdr;
     hdr << "time,com_x,com_y,com_z";
     for (int i = 0; i < model->nu; ++i) {
       const char* act_name = mj_id2name(model, mjOBJ_ACTUATOR, i);
+      auto header_name = [&](const char* base, const char* name) {
+        if (name && *name) return std::string(base) + name;
+        return std::string(base) + "unnamed";
+      };
       hdr << ',' << header_name("torque_error_", act_name);
       hdr << ',' << header_name("torque_cmd_", act_name);
       hdr << ',' << header_name("torque_applied_", act_name);
@@ -369,7 +346,7 @@ void QuadrupedFlatMod::ResidualFn::MaybeLogStep(
       hdr << ",grf_" << kFootLabels[foot] << "_fy";
       hdr << ",grf_" << kFootLabels[foot] << "_fz";
     }
-    // MOD: add target-joint trace and penalties to CSV header
+    // Mod-specific target trace and penalties (before knobs). Heat/energy will be appended by logger.
     for (int foot = 0; foot < 4; ++foot) {
       hdr << ",target_joint_" << kFootLabels[foot];
       hdr << ",target_tx_" << kFootLabels[foot];
@@ -378,14 +355,12 @@ void QuadrupedFlatMod::ResidualFn::MaybeLogStep(
     }
     hdr << ",power_penalty_total";
     hdr << ",fixation_penalty_total";
-    hdr << ",energy_abs_j,energy_signed_j,phase_tag";
-    // Log current knobs/weights for debugging cost effects
     hdr << ",fixation_weight,power_penalty_weight,target_smooth_tau,target_blend_alpha";
     hdr << ",grf_weight_default,grf_per_foot_scale_0,grf_per_foot_scale_1,grf_per_foot_scale_2,grf_per_foot_scale_3";
     hdr << ",internal_grf_align_weight,mode,gait";
-    hdr << '\n';
-    state->stream << hdr.str();
-    state->header_written = true;
+    // Append energy/phase column labels to match vanilla task output.
+    hdr << ",energy_abs_j,energy_signed_j,phase_tag";
+    logger.EnsureHeader(hdr.str());
   }
 
   std::ostringstream row;
@@ -394,12 +369,6 @@ void QuadrupedFlatMod::ResidualFn::MaybeLogStep(
 
   double* com = SensorByName(model, data, "torso_subtreecom");
   row << ',' << com[0] << ',' << com[1] << ',' << com[2];
-
-  double dt = 0.0;
-  if (std::isfinite(state->last_time)) {
-    dt = t - state->last_time;
-    if (dt < 0.0) dt = 0.0;
-  }
 
   double step_energy_signed = 0.0;
   double step_energy_abs = 0.0;
@@ -410,20 +379,24 @@ void QuadrupedFlatMod::ResidualFn::MaybeLogStep(
     double diff = cmd - applied;
 
     double vel = 0.0;
-    int joint_id = (i < static_cast<int>(state->actuator_joint_ids.size()))
-                       ? state->actuator_joint_ids[i]
-                       : -1;
+    int joint_id = model->actuator_trnid[2 * i];
     if (joint_id >= 0) {
       int dof_adr = model->jnt_dofadr[joint_id];
-      vel = data->qvel[dof_adr];
+      if (dof_adr >= 0) vel = data->qvel[dof_adr];
     }
 
     row << ',' << diff << ',' << cmd << ',' << applied << ',' << vel;
 
-    if (dt > 0.0) {
-      double power = applied * vel;
-      step_energy_signed += power * dt;
-      step_energy_abs += std::abs(power) * dt;
+    // step integration will be handled by logger; here compute per-step
+    // energies using the delta from the logger's last recorded time.
+    if (std::isfinite(prev_last_time)) {
+      double dt = t - prev_last_time;
+      if (dt < 0.0) dt = 0.0;
+      if (dt > 0.0) {
+        double power = applied * vel;
+        step_energy_signed += power * dt;
+        step_energy_abs += std::abs(power) * dt;
+      }
     }
   }
 
@@ -462,17 +435,7 @@ void QuadrupedFlatMod::ResidualFn::MaybeLogStep(
         << info.force[2];
   }
 
-  if (measurement_active && dt > 0.0) {
-    state->energy_signed += step_energy_signed;
-    state->energy_abs += step_energy_abs;
-  }
-
-  // append energy and custom penalties
-  row << ',' << state->energy_abs << ',' << state->energy_signed
-      << ',' << power_pen_total << ',' << fixation_pen_total
-      << ',' << (measurement_active ? 1 : 0);
-
-  // append per-foot target joint and target vector (if available)
+    // append per-foot target joint and target vector (if available)
   double* foot_pos[ResidualFn::kNumFoot];
   for (ResidualFn::A1Foot f : ResidualFn::kFootAll) foot_pos[f] = data->geom_xpos + 3 * foot_geom_id_[f];
   for (int foot = 0; foot < 4; ++foot) {
@@ -502,6 +465,8 @@ void QuadrupedFlatMod::ResidualFn::MaybeLogStep(
     }
     row << ',' << sel << ',' << tx << ',' << ty << ',' << tz;
   }
+    // append power/fixation totals (match header order)
+    row << ',' << power_pen_total << ',' << fixation_pen_total;
 
     // append current knob values for post-hoc debugging
     row << ',' << fixation_weight_ << ',' << power_penalty_weight_
@@ -510,9 +475,9 @@ void QuadrupedFlatMod::ResidualFn::MaybeLogStep(
     for (int i = 0; i < 4; ++i) row << ',' << grf_per_foot_scale_[i];
     row << ',' << internal_grf_align_weight_;
     row << ',' << static_cast<int>(current_mode_) << ',' << static_cast<int>(current_gait_);
-    row << '\n';
-    state->stream << row.str();
-  state->last_time = t;
+
+    // Use shared logger to append energy and phase tag and write the line.
+    logger.AppendRow(row.str(), t, step_energy_abs, step_energy_signed, measurement_active, static_cast<int>(current_gait_));
 }
 
 std::string QuadrupedHillMod::XmlPath() const {
@@ -573,11 +538,24 @@ bool QuadrupedFlatMod::ResidualFn::ComputePerFootResidualForTest(
 
   double grf_proj[3];
   ProjectOntoPlane(grf_proj, foot_force, plane_normal);
-  double diff[3];
-  mju_sub3(diff, grf_proj, sel.motor_proj);
+  // Normalize projected GRF and motor projection to compare directions
+  const double kEps = 1e-8;
+  double grf_norm = mju_norm3(grf_proj);
+  double motor_norm = mju_norm3(sel.motor_proj);
+  if (grf_norm < kEps && motor_norm < kEps) {
+    // Nothing sensible to compare
+    mju_zero3(out_res);
+    return true;
+  }
+  double grf_dir[3] = {0.0, 0.0, 0.0};
+  double motor_dir[3] = {0.0, 0.0, 0.0};
+  if (grf_norm >= kEps) mju_scl3(grf_dir, grf_proj, 1.0 / (grf_norm + kEps));
+  if (motor_norm >= kEps) mju_scl3(motor_dir, sel.motor_proj, 1.0 / (motor_norm + kEps));
+  double diff_dir[3];
+  mju_sub3(diff_dir, grf_dir, motor_dir);
   // scale residual by sqrt(grf_weight)
   double scl = grf_weight > 0.0 ? std::sqrt(grf_weight) : 0.0;
-  mju_copy3(out_res, diff);
+  mju_copy3(out_res, diff_dir);
   mju_scl3(out_res, out_res, scl);
   return true;
 }
@@ -761,7 +739,16 @@ void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
     }
     double power_term = 0.0;
     if (power_penalty_weight_ > 0.0) {
-      power_term = std::sqrt(power_penalty_weight_) * (applied * qvel);
+      // Support both L2 (signed) and L1 (absolute, smoothed) modes.
+      const double kPowerEps = 1e-8;
+      double raw = applied * qvel;
+      if (power_penalty_mode_ == "l1") {
+        // Smoothed absolute to preserve differentiability near zero.
+        power_term = std::sqrt(power_penalty_weight_) * std::sqrt(raw * raw + kPowerEps);
+      } else {
+        // Default: signed L2-like term (preserve legacy behaviour).
+        power_term = std::sqrt(power_penalty_weight_) * raw;
+      }
     }
     residual[counter + i] = base + power_term;
   }
@@ -1123,24 +1110,58 @@ void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
     double grf_proj[3];
     ProjectOntoPlane(grf_proj, info.force, plane_normal);
 
-    double diff[3];
-    mju_sub3(diff, grf_proj, selection.motor_proj);
-    double diff_norm = mju_norm3(diff);
+    // Compare directions (unit vectors) rather than raw magnitudes to focus
+    // on alignment, as suggested by Kuznetsov.
+    const double kEps = 1e-8;
+    double grf_norm = mju_norm3(grf_proj);
+    double motor_norm_sel = mju_norm3(selection.motor_proj);
+    double grf_dir[3] = {0.0, 0.0, 0.0};
+    // Reuse the previously-declared motor_dir and overwrite with the
+    // filtered projection's normalized direction.
+    mju_zero3(motor_dir);
+    if (grf_norm >= kEps) mju_scl3(grf_dir, grf_proj, 1.0 / (grf_norm + kEps));
+    if (motor_norm_sel >= kEps) mju_scl3(motor_dir, selection.motor_proj, 1.0 / (motor_norm_sel + kEps));
+
+    double diff_dir[3];
+    mju_sub3(diff_dir, grf_dir, motor_dir);
+    double diff_norm = mju_norm3(diff_dir);
+
+    // Keep a small magnitude penalty to avoid purely directional drift.
     const double kGrfMagnitudeWeight = 1e-4;
-    double cost_val = 0.5 * diff_norm * diff_norm +
-                   0.5 * kGrfMagnitudeWeight *
-                     mju_dot3(grf_proj, grf_proj);
+    double mag_pen = kGrfMagnitudeWeight * mju_dot3(grf_proj, grf_proj);
+    double cost_val = 0.5 * diff_norm * diff_norm + 0.5 * mag_pen;
     hind_alignment[hind_idx] = mju_sqrt(cost_val);
 
-    // Fill per-foot residual (vector) for hind foot. Scale by sqrt(weight)
-    // so that 0.5 * ||res||^2 ~= weight * 0.5 * ||diff||^2.
+    // Fill per-foot residual (vector) for hind foot. Use directional diff
+    // scaled by configured weight. Additionally optionally penalize the
+    // horizontal magnitude to discourage excessive Fx/Fy if configured.
     double scale = std::max(0.0, grf_hind_weight_);
     double scale_sqrt = std::sqrt(scale);
     double perfoot_scaled[3];
-    mju_copy3(perfoot_scaled, diff);
+    mju_copy3(perfoot_scaled, diff_dir);
     mju_scl3(perfoot_scaled, perfoot_scaled, scale_sqrt);
-    // NOTE: runtime GRF sensor scaling intentionally disabled — use raw
-    // measured GRF to avoid masking true energy effects.
+
+    // Optional horizontal magnitude penalty (toggleable). Gate by contact
+    // vertical force to avoid acting on weak contacts.
+    if (grf_horiz_weight_ > 0.0 && info.force[2] >= min_contact_fz) {
+      double horiz = std::sqrt(info.force[0] * info.force[0] +
+                               info.force[1] * info.force[1]);
+      if (horiz > kEps) {
+        double hx = info.force[0] / horiz;
+        double hy = info.force[1] / horiz;
+        double horiz_term = std::sqrt(grf_horiz_weight_) * horiz;
+        perfoot_scaled[0] += hx * horiz_term;
+        perfoot_scaled[1] += hy * horiz_term;
+      }
+    }
+
+    // Clamp per-foot residual magnitude to avoid exploding objectives.
+    double per_norm = mju_norm3(perfoot_scaled);
+    if (per_norm > grf_max_residual_ && per_norm > 0.0) {
+      double scale_down = grf_max_residual_ / per_norm;
+      mju_scl3(perfoot_scaled, perfoot_scaled, scale_down);
+    }
+
     for (int j = 0; j < 3; ++j) {
       residual[perfoot_res_base + 3 * foot + j] = perfoot_scaled[j];
     }
@@ -1233,6 +1254,12 @@ void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
     double perfoot_scaled[3];
     mju_copy3(perfoot_scaled, diff);
     mju_scl3(perfoot_scaled, perfoot_scaled, scale_sqrt);
+    // Clamp to prevent exploding contributions when weights are large.
+    double per_norm = mju_norm3(perfoot_scaled);
+    if (per_norm > grf_max_residual_ && per_norm > 0.0) {
+      double scale_down = grf_max_residual_ / per_norm;
+      mju_scl3(perfoot_scaled, perfoot_scaled, scale_down);
+    }
     for (int j = 0; j < 3; ++j) {
       residual[perfoot_res_base + 3 * foot + j] = perfoot_scaled[j];
     }
@@ -2144,6 +2171,13 @@ void QuadrupedFlatMod::ResetLocked(const mjModel* model) {
   set_default("MJPC_GRF_PER_FOOT_SCALE", "0.8,0.8,1.2,1.2");
   set_default("MJPC_GRF_HIND_WEIGHT", "1e-7");
   set_default("MJPC_GRF_FRONT_WEIGHT", "1e-7");
+  // Optional horizontal GRF penalty (disabled by default to avoid
+  // destabilizing behaviour seen in prior experiments). Enable/disable
+  // with MJPC_GRF_HORIZ_WEIGHT and tune with caution.
+  set_default("MJPC_GRF_HORIZ_WEIGHT", "0");
+  // Safety clamp on per-foot residual magnitude to prevent exploding
+  // objectives when weights are increased.
+  set_default("MJPC_GRF_MAX_RESIDUAL", "0.5");
   set_default("MJPC_INTERNAL_GRF_ALIGN_WEIGHT", "1e-3");
   set_default("MJPC_TARGET_SMOOTH_TAU", "1.0");
   set_default("MJPC_TARGET_BLEND_ALPHA", "0.6");
@@ -2293,6 +2327,17 @@ void QuadrupedFlatMod::ResetLocked(const mjModel* model) {
   }
   if (const char* envfh = std::getenv("MJPC_GRF_FRONT_WEIGHT")) {
     try { residual_.grf_front_weight_ = std::stod(std::string(envfh)); } catch(...) {}
+  }
+
+  // Optional horizontal GRF penalty weight (gate: set to 0 to disable)
+  if (const char* envhhz = std::getenv("MJPC_GRF_HORIZ_WEIGHT")) {
+    try { residual_.grf_horiz_weight_ = std::stod(std::string(envhhz)); } catch(...) { residual_.grf_horiz_weight_ = 0.0; }
+  }
+
+  // Clamp magnitude for per-foot residual vectors to avoid exploding
+  // contributions when weights are tuned aggressively.
+  if (const char* envmr = std::getenv("MJPC_GRF_MAX_RESIDUAL")) {
+    try { residual_.grf_max_residual_ = std::stod(std::string(envmr)); } catch(...) { residual_.grf_max_residual_ = 0.5; }
   }
 
   // contact stability override

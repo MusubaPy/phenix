@@ -35,6 +35,8 @@ add_library(
   trajectory.h
   utilities.cc
   utilities.h
+  common/csv_logger.cc
+  common/csv_logger.h
   tasks/tasks.cc
   tasks/tasks.h
   tasks/quadruped_mod/quadruped_mod.cc
@@ -165,6 +167,8 @@ add_library(
   trajectory.h
   utilities.cc
   utilities.h
+  common/csv_logger.cc
+  common/csv_logger.h
   tasks/tasks.cc
   tasks/tasks.h
   tasks/quadruped_mod/quadruped_mod.cc
@@ -273,6 +277,8 @@ add_library(
   trajectory.h
   utilities.cc
   utilities.h
+  common/csv_logger.cc
+  common/csv_logger.h
   tasks/tasks.cc
   tasks/tasks.h
   tasks/quadruped_mod/quadruped_mod.cc

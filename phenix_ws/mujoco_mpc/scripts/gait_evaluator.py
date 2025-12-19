@@ -43,7 +43,7 @@ def to_float(s):
         return float('nan')
 
 
-def compute_metrics(rows, fields):
+def compute_metrics(rows, fields, heat_coef=0.0):
     # collect columns
     data = defaultdict(list)
     for r in rows:
@@ -84,6 +84,7 @@ def compute_metrics(rows, fields):
     n_act = min(len(torque_cols), len(vel_cols))
     total_abs = 0.0
     total_signed = 0.0
+    total_heat = 0.0
     if len(time) >= 2 and n_act > 0:
         for i in range(1, len(time)):
             dt = time[i] - time[i - 1]
@@ -91,17 +92,25 @@ def compute_metrics(rows, fields):
                 continue
             step_abs = 0.0
             step_signed = 0.0
+            step_heat = 0.0
             for j in range(n_act):
                 a = to_float(rows[i].get(torque_cols[j], '0'))
                 v = to_float(rows[i].get(vel_cols[j], '0'))
                 p = a * v
                 step_signed += p * dt
                 step_abs += abs(p) * dt
+                # heat losses per actuator ~ c * torque^2
+                if heat_coef and not math.isnan(a):
+                    step_heat += (a * a) * dt * heat_coef
             total_abs += step_abs
             total_signed += step_signed
+            total_heat += step_heat
     res['total_energy_abs_j'] = total_abs
     res['total_energy_signed_j'] = total_signed
+    res['total_heat_losses_j'] = total_heat
+    res['total_energy_abs_with_heat_j'] = total_abs + total_heat
     res['energy_per_m_corrected'] = total_abs / dist if dist > 0 else float('inf')
+    res['energy_per_m_with_heat'] = (total_abs + total_heat) / dist if dist > 0 else float('inf')
 
     # Compare with logged cumulative column `energy_abs_j` if available
     energy_col = [to_float(r.get('energy_abs_j', 'nan')) for r in rows]
@@ -247,6 +256,16 @@ def main():
     ap.add_argument('--csv', required=True, help='Path to CSV file')
     ap.add_argument('--log', required=False, help='Optional log/stdout file to parse for divergence warnings')
     ap.add_argument('--out', required=False, default=None, help='Output json filename (default: CSVname_eval.json)')
+    ap.add_argument('--start-time', required=False, default=0.0, type=float,
+                    help='Ignore rows before this time (seconds); useful to skip warm-up')
+    ap.add_argument('--heat-coef', required=False, default=0.0, type=float,
+                    help='Coefficient c for heat losses term (power_loss = c * torque^2). If zero, heat losses are ignored.')
+    ap.add_argument('--motor-ra', required=False, default=None, type=float,
+                    help='Actuator electrical resistance Ra (optional). If provided with --motor-gear and --motor-kt, will compute heat-coef = Ra * Gs^2 / Kt^2')
+    ap.add_argument('--motor-gear', required=False, default=None, type=float,
+                    help='Gear ratio Gs (optional).')
+    ap.add_argument('--motor-kt', required=False, default=None, type=float,
+                    help='Motor torque constant Kt (optional).')
     ap.add_argument('--plots', required=False, default=None, help='Output directory for plots (optional)')
     args = ap.parse_args()
 
@@ -255,7 +274,32 @@ def main():
         sys.exit(2)
 
     rows, fields = read_csv(args.csv)
-    metrics = compute_metrics(rows, fields)
+    # Optionally drop early rows before start_time (burn-in)
+    start_time = float(args.start_time)
+    if start_time > 0.0 and rows:
+        # find first index with time >= start_time
+        start_idx = 0
+        time_vals = []
+        for r in rows:
+            try:
+                time_vals.append(float(r.get('time', 'nan')))
+            except Exception:
+                time_vals.append(float('nan'))
+        for i, t in enumerate(time_vals):
+            if not math.isnan(t) and t >= start_time:
+                start_idx = i
+                break
+        # slice rows
+        rows = rows[start_idx:]
+    # compute heat coefficient if motor params provided
+    heat_coef = float(args.heat_coef)
+    try:
+        if heat_coef == 0.0 and args.motor_ra is not None and args.motor_gear is not None and args.motor_kt is not None:
+            heat_coef = float(args.motor_ra) * (float(args.motor_gear) ** 2) / (float(args.motor_kt) ** 2)
+    except Exception:
+        pass
+
+    metrics = compute_metrics(rows, fields, heat_coef=heat_coef)
     log_metrics = parse_log(args.log) if args.log else {'divergence_count': 0, 'nan_warnings': 0}
     report = {
         'csv': args.csv,

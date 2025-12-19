@@ -16,7 +16,6 @@
 #define MJPC_TASKS_QUADRUPED_QUADRUPED_H_
 
 #include <string>
-#include <fstream>
 #include <mutex>
 #include <memory>
 #include <vector>
@@ -230,23 +229,10 @@ class QuadrupedFlat : public Task {
     double jump_rot_vel_      = 0;
     double jump_rot_acc_      = 0;
     double land_rot_acc_      = 0;
-    // CSV logging state shared across residual copies (optional dataset output)
-    struct CsvLogState {
-      std::mutex state_mutex;
-      bool stream_ready = false;
-      bool header_written = false;
-      double last_time = -std::numeric_limits<double>::infinity();
-      double energy_abs = 0.0;
-      double energy_signed = 0.0;
-      int energy_reset_count = 0;
-      std::string path = "logs/quadruped_log.csv";
-      std::vector<int> actuator_joint_ids;
-      std::ofstream stream;
-    };
-
+    // CSV logging is handled by the shared `mjpc::CsvLogger` utility. The
+    // previous per-task CsvLogState has been removed in favor of the single
+    // shared logger to avoid truncation races and lock-order complexity.
     void MaybeLogStep(const mjModel* model, const mjData* data, bool measurement_active) const;
-
-    mutable std::shared_ptr<CsvLogState> csv_log_state_ = std::make_shared<CsvLogState>();
   };
 
   QuadrupedFlat() : residual_(this) {}
