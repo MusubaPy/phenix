@@ -1,3 +1,4 @@
+#include <absl/flags/flag.h>
 // Copyright 2022 DeepMind Technologies Limited
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -686,6 +687,17 @@ void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
                                 model->opt.gravity[2]};
   mju_scl3(expected_contact, expected_contact, -total_mass_);
   double net_residual[3];
+  // Recompute net_grf after applying per-foot scaling so env overrides take effect.
+  double scaled_net_grf[3] = {0.0, 0.0, 0.0};
+  for (A1Foot foot : kFootAll) {
+    FootContactInfo& info = contact_info[foot];
+    double scale = grf_per_foot_scale_[foot];
+    double scaled[3] = {info.force[0] * scale,
+                        info.force[1] * scale,
+                        info.force[2] * scale};
+    mju_addTo3(scaled_net_grf, scaled);
+  }
+  mju_copy3(net_grf, scaled_net_grf);
   mju_sub3(net_residual, net_grf, expected_contact);
   mju_copy(residual + counter, net_residual, 3);
   counter += 3;
@@ -693,7 +705,8 @@ void QuadrupedFlatMod::ResidualFn::Residual(const mjModel* model,
   // ---------- Internal Force Alignment (Kuznetsov) ----------
   // Added to GRF cost as an improvement.
   // Penalize forces that deviate from the optimal plane defined by hip/knee.
-  const double kAlignmentWeight = 0.0; 
+  // Alignment weight is driven by the internal flag and scaled by transition boost.
+  double kAlignmentWeight = internal_grf_align_weight_ * grf_transition_boost_;
   constexpr int kContactStableSteps = 5;
   for (A1Foot foot : kFootAll) {
     double alignment_residual[3] = {0.0, 0.0, 0.0};
@@ -1073,11 +1086,7 @@ void QuadrupedFlatMod::TransitionLocked(mjModel* model, mjData* data) {
     }
     residual_.last_transition_time_ = residual_.phase_start_time_ =
         residual_.phase_start_ = data->time;
-
   }
-
-  // Warmup/measurement gating removed — CSV logging now uses the logger's
-  // internal bookkeeping only and is always allowed to record when enabled.
 
   // ---------- prevent forbidden mode transitions ----------
   // switching mode, not from quadruped
@@ -1840,6 +1849,57 @@ void QuadrupedFlatMod::ResetLocked(const mjModel* model) {
     residual_.grf_weight_default_ = weight[residual_.grf_cost_id_];
   }
 
+  // Allow overriding GRF weight from environment
+  if (const char* envw = std::getenv("MJPC_GRF_WEIGHT")) {
+    try {
+      double w = std::stod(std::string(envw));
+      if (residual_.grf_cost_id_ >= 0 && residual_.grf_cost_id_ < weight.size()) {
+        weight[residual_.grf_cost_id_] = w;
+        residual_.grf_weight_default_ = w;
+      }
+    } catch (...) {}
+  }
+
+  // Per-foot GRF scale: comma-separated 4 values
+  if (const char* envs = std::getenv("MJPC_GRF_PER_FOOT_SCALE")) {
+    std::string s(envs);
+    std::vector<double> vals;
+    size_t start = 0;
+    while (start < s.size()) {
+      size_t pos = s.find(',', start);
+      std::string tok = (pos == std::string::npos) ? s.substr(start) : s.substr(start, pos - start);
+      try {
+        vals.push_back(std::stod(tok));
+      } catch (...) {
+        vals.push_back(1.0);
+      }
+      if (pos == std::string::npos) break;
+      start = pos + 1;
+    }
+    for (size_t i = 0; i < 4 && i < vals.size(); ++i) {
+      residual_.grf_per_foot_scale_[i] = vals[i];
+    }
+  }
+
+  if (const char* envt = std::getenv("MJPC_GRF_TRANSITION_BOOST")) {
+    try { residual_.grf_transition_boost_ = std::stod(std::string(envt)); } catch(...) {}
+  }
+
+  // Keep normalize and loss mix available for future behavior control
+  if (const char* envn = std::getenv("MJPC_GRF_NORMALIZE")) {
+    std::string v(envn);
+    residual_.grf_normalize_ = (v == "1" || v == "true" || v == "True");
+  }
+  if (const char* envlm = std::getenv("MJPC_GRF_LOSS_MIX")) {
+    try { residual_.grf_loss_mix_ = std::stod(std::string(envlm)); } catch(...) { residual_.grf_loss_mix_ = 0.0; }
+  }
+
+  // Cache internal alignment weight (can be overridden by environment variable)
+  residual_.internal_grf_align_weight_ = 1e-3;
+  if (const char* env_iaw = std::getenv("MJPC_INTERNAL_GRF_ALIGN_WEIGHT")) {
+    try { residual_.internal_grf_align_weight_ = std::stod(std::string(env_iaw)); } catch(...) {}
+  }
+
   // ----------  model identifiers  ----------
   residual_.torso_body_id_ = mj_name2id(model, mjOBJ_XBODY, "trunk");
   (void)residual_.torso_body_id_;
@@ -1919,14 +1979,14 @@ void QuadrupedFlatMod::ResetLocked(const mjModel* model) {
   }
   (void)residual_.total_mass_;
 
-  // стартовый режим по умолчанию — Quadruped / Stand (статичная стойка)
-  mode = ResidualFn::kModeQuadruped;
-  residual_.current_mode_ = ResidualFn::kModeQuadruped;
-  if (residual_.gait_param_id_ >= 0 &&
-      residual_.gait_param_id_ < parameters.size()) {
-    parameters[residual_.gait_param_id_] =
-        ReinterpretAsDouble(ResidualFn::kGaitStand);
-  }
+  // // стартовый режим по умолчанию — Quadruped / Stand (статичная стойка)
+  // mode = ResidualFn::kModeQuadruped;
+  // residual_.current_mode_ = ResidualFn::kModeQuadruped;
+  // if (residual_.gait_param_id_ >= 0 &&
+  //     residual_.gait_param_id_ < parameters.size()) {
+  //   parameters[residual_.gait_param_id_] =
+  //       ReinterpretAsDouble(ResidualFn::kGaitStand);
+  // }
 
   // ----------  derived kinematic quantities for Flip  ----------
   residual_.gravity_ = mju_norm3(model->opt.gravity);

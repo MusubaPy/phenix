@@ -2,7 +2,17 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="${BUILD_BIN:-$ROOT_DIR/build/bin/mjpc}"
+if [[ -n "${BUILD_BIN:-}" ]]; then
+    BIN="$BUILD_BIN"
+else
+    # Prefer the `mjpc_mod` binary when present so mod variants run by default.
+    if [[ -x "$ROOT_DIR/build/bin/mjpc_mod" ]]; then
+        BIN="$ROOT_DIR/build/bin/mjpc_mod"
+    else
+        BIN="$ROOT_DIR/build/bin/mjpc"
+    fi
+fi
+echo "Using binary: $BIN"
 OUTDIR="$ROOT_DIR/logs/sweep_grf/variants"
 mkdir -p "$OUTDIR"
 

@@ -216,6 +216,13 @@ class QuadrupedFlatMod : public Task {
     double save_gait_switch_  = 0;
     std::vector<double> save_weight_;
 
+    // GRF tuning parameters (can be set from env vars in ResetLocked)
+    double grf_per_foot_scale_[4] = {1.0, 1.0, 1.0, 1.0};
+    bool grf_normalize_ = false;
+    double grf_loss_mix_ = 0.0;
+    double grf_transition_boost_ = 1.0;
+    double internal_grf_align_weight_ = 0.001;
+
     // gait-related states
     double current_gait_      = kGaitStand;
     double phase_start_       = 0;

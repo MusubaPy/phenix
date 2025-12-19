@@ -233,8 +233,131 @@ void QuadrupedFlat::ResidualFn::Residual(const mjModel* model,
 
   // sensor dim sanity check
   CheckSensorDim(model, counter);
+  // Optional CSV logging for dataset collection. Writes to path specified by
+  // MJPC_CSV_LOG env var or default `logs/quadruped_log.csv`.
+  MaybeLogStep(model, data, true);
 }
 
+
+void QuadrupedFlat::ResidualFn::MaybeLogStep(const mjModel* model, const mjData* data, bool measurement_active) const {
+  auto state = csv_log_state_;
+  if (!state) return;
+
+  std::unique_lock<std::mutex> lock(state->state_mutex);
+
+  if (!state->stream_ready) {
+    const char* env_path = std::getenv("MJPC_CSV_LOG");
+    if (env_path && *env_path) {
+      state->path = env_path;
+    }
+
+    std::filesystem::path csv_path(state->path);
+    if (csv_path.has_parent_path() && !csv_path.parent_path().empty()) {
+      std::error_code ec;
+      std::filesystem::create_directories(csv_path.parent_path(), ec);
+    }
+
+    state->stream.open(csv_path, std::ios::out | std::ios::trunc);
+    if (!state->stream.is_open()) {
+      return;
+    }
+
+    if (state->actuator_joint_ids.empty()) {
+      state->actuator_joint_ids.resize(model->nu, -1);
+      for (int i = 0; i < model->nu; ++i) {
+        state->actuator_joint_ids[i] = model->actuator_trnid[2 * i];
+      }
+    }
+
+    state->stream_ready = true;
+  }
+
+  double t = data->time;
+  if (t <= state->last_time + 1e-9) return;
+
+  auto header_name = [](const char* base, const char* name) {
+    if (name && *name) return std::string(base) + name;
+    return std::string(base) + "unnamed";
+  };
+
+  if (!state->header_written) {
+    std::ostringstream hdr;
+    hdr << "time,com_x,com_y,com_z";
+    for (int i = 0; i < model->nu; ++i) {
+      const char* act_name = mj_id2name(model, mjOBJ_ACTUATOR, i);
+      hdr << ',' << header_name("torque_error_", act_name);
+      hdr << ',' << header_name("torque_cmd_", act_name);
+      hdr << ',' << header_name("torque_applied_", act_name);
+      hdr << ',' << header_name("joint_vel_", act_name);
+    }
+    for (int foot = 0; foot < 4; ++foot) {
+      const char* kFootLabels[4] = {"FL","HL","FR","HR"};
+      hdr << ",grf_" << kFootLabels[foot] << "_fx";
+      hdr << ",grf_" << kFootLabels[foot] << "_fy";
+      hdr << ",grf_" << kFootLabels[foot] << "_fz";
+    }
+    hdr << ",energy_abs_j,energy_signed_j,phase_tag";
+    hdr << '\n';
+    state->stream << hdr.str();
+    state->header_written = true;
+  }
+
+  std::ostringstream row;
+  row << std::fixed << std::setprecision(6);
+  row << t;
+
+  double* com = SensorByName(model, data, "torso_subtreecom");
+  row << ',' << com[0] << ',' << com[1] << ',' << com[2];
+
+  double dt = 0.0;
+  if (std::isfinite(state->last_time)) {
+    dt = t - state->last_time;
+    if (dt < 0.0) dt = 0.0;
+  }
+
+  double step_energy_signed = 0.0;
+  double step_energy_abs = 0.0;
+
+  for (int i = 0; i < model->nu; ++i) {
+    double cmd = data->ctrl[i];
+    double applied = data->actuator_force[i];
+    double diff = cmd - applied;
+
+    double vel = 0.0;
+    int joint_id = (i < static_cast<int>(state->actuator_joint_ids.size()))
+                       ? state->actuator_joint_ids[i]
+                       : -1;
+    if (joint_id >= 0) {
+      int dof_adr = model->jnt_dofadr[joint_id];
+      vel = data->qvel[dof_adr];
+    }
+
+    row << ',' << diff << ',' << cmd << ',' << applied << ',' << vel;
+
+    if (dt > 0.0) {
+      double power = applied * vel;
+      step_energy_signed += power * dt;
+      step_energy_abs += std::abs(power) * dt;
+    }
+  }
+
+  // No contact info available for vanilla task; write zeros for GRF columns.
+  for (int foot = 0; foot < 4; ++foot) {
+    row << ',' << 0.0 << ',' << 0.0 << ',' << 0.0;
+  }
+
+  if (measurement_active && dt > 0.0) {
+    state->energy_signed += step_energy_signed;
+    state->energy_abs += step_energy_abs;
+  }
+
+  row << ',' << state->energy_abs << ',' << state->energy_signed
+      << ',' << (measurement_active ? 1 : 0);
+
+  row << '\n';
+  state->stream << row.str();
+  state->last_time = t;
+}
 //  ============  transition  ============
 void QuadrupedFlat::TransitionLocked(mjModel* model, mjData* data) {
   // ---------- handle mjData reset ----------

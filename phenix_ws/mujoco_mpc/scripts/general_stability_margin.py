@@ -1,6 +1,10 @@
 # Adapted general stability margin tool
 # (content based on the user's attached script - trimmed to essential functions)
-import pandas as pd
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+    import csv
 import numpy as np
 
 # Constants used in the original script
@@ -25,47 +29,99 @@ def normalize(v):
 
 
 def get_value(dataset_name: str):
-    ds = pd.read_csv(dataset_name, index_col=0, comment='#')
-    # ensure time index is numeric
-    try:
-        ds.index = ds.index.astype(float)
-    except Exception:
-        pass
+    if pd is not None:
+        ds = pd.read_csv(dataset_name, index_col=0, comment='#')
+        # ensure time index is numeric
+        try:
+            ds.index = ds.index.astype(float)
+        except Exception:
+            pass
 
-    # trim end: convert wall_crash samples -> seconds
-    wall_crash_seconds = wall_crash * step
-    max_time = float(ds.index.max())
-    end_time = max_time - wall_crash_seconds
+        # trim end: convert wall_crash samples -> seconds
+        wall_crash_seconds = wall_crash * step
+        max_time = float(ds.index.max())
+        end_time = max_time - wall_crash_seconds
 
-    # filter by time: start at `start_time_sec`, end at `end_time`
-    ds = ds[(ds.index >= start_time_sec) & (ds.index <= end_time)]
+        # filter by time: start at `start_time_sec`, end at `end_time`
+        ds = ds[(ds.index >= start_time_sec) & (ds.index <= end_time)]
 
-    # if dataset is empty after trimming, return empty arrays
-    if ds.shape[0] == 0:
-        return np.array([]), np.array([])
+        # if dataset is empty after trimming, return empty arrays
+        if ds.shape[0] == 0:
+            return np.array([]), np.array([])
 
-    grf_leg0_x = ds['grf_leg0_x'].tolist()
-    grf_leg1_x = ds['grf_leg1_x'].tolist()
-    grf_leg2_x = ds['grf_leg2_x'].tolist()
-    grf_leg3_x = ds['grf_leg3_x'].tolist()
+        grf_leg0_x = ds['grf_leg0_x'].tolist()
+        grf_leg1_x = ds['grf_leg1_x'].tolist()
+        grf_leg2_x = ds['grf_leg2_x'].tolist()
+        grf_leg3_x = ds['grf_leg3_x'].tolist()
 
-    grf_leg0_y = ds['grf_leg0_y'].tolist()
-    grf_leg1_y = ds['grf_leg1_y'].tolist()
-    grf_leg2_y = ds['grf_leg2_y'].tolist()
-    grf_leg3_y = ds['grf_leg3_y'].tolist()
+        grf_leg0_y = ds['grf_leg0_y'].tolist()
+        grf_leg1_y = ds['grf_leg1_y'].tolist()
+        grf_leg2_y = ds['grf_leg2_y'].tolist()
+        grf_leg3_y = ds['grf_leg3_y'].tolist()
 
-    grf_leg0_z = ds['grf_leg0_z'].tolist()
-    grf_leg1_z = ds['grf_leg1_z'].tolist()
-    grf_leg2_z = ds['grf_leg2_z'].tolist()
-    grf_leg3_z = ds['grf_leg3_z'].tolist()
+        grf_leg0_z = ds['grf_leg0_z'].tolist()
+        grf_leg1_z = ds['grf_leg1_z'].tolist()
+        grf_leg2_z = ds['grf_leg2_z'].tolist()
+        grf_leg3_z = ds['grf_leg3_z'].tolist()
 
-    f_net_x = [grf_leg0_x[i] + grf_leg1_x[i] + grf_leg2_x[i] + grf_leg3_x[i] for i in range(0, len(grf_leg1_x))]
-    f_net_y = [grf_leg0_y[i] + grf_leg1_y[i] + grf_leg2_y[i] + grf_leg3_y[i] for i in range(0, len(grf_leg1_y))]
-    f_net_z = [grf_leg0_z[i] + grf_leg1_z[i] + grf_leg2_z[i] + grf_leg3_z[i] for i in range(0, len(grf_leg1_z))]
+        f_net_x = [grf_leg0_x[i] + grf_leg1_x[i] + grf_leg2_x[i] + grf_leg3_x[i] for i in range(0, len(grf_leg1_x))]
+        f_net_y = [grf_leg0_y[i] + grf_leg1_y[i] + grf_leg2_y[i] + grf_leg3_y[i] for i in range(0, len(grf_leg1_y))]
+        f_net_z = [grf_leg0_z[i] + grf_leg1_z[i] + grf_leg2_z[i] + grf_leg3_z[i] for i in range(0, len(grf_leg1_z))]
 
-    body_position_x = ds['body_pose_position_x'].tolist()
-    body_position_y = ds['body_pose_position_y'].tolist()
-    body_position_z = ds['body_pose_position_z'].tolist()
+        body_position_x = ds['body_pose_position_x'].tolist()
+        body_position_y = ds['body_pose_position_y'].tolist()
+        body_position_z = ds['body_pose_position_z'].tolist()
+    else:
+        # minimal csv reader fallback
+        with open(dataset_name, newline='') as f:
+            reader = csv.DictReader(f)
+            rows = [r for r in reader]
+        # try to use time index and filter by time
+        if not rows:
+            return np.array([]), np.array([])
+        times = []
+        for r in rows:
+            try:
+                times.append(float(next(iter(r.values()))))
+            except Exception:
+                times.append(float('nan'))
+
+        wall_crash_seconds = wall_crash * step
+        max_time = max(times)
+        end_time = max_time - wall_crash_seconds
+        # filter rows
+        rows_trim = [r for t, r in zip(times, rows) if (t >= start_time_sec and t <= end_time)]
+        if not rows_trim:
+            return np.array([]), np.array([])
+
+        def get_list(col):
+            return [float(r[col]) if r.get(col, '') != '' else 0.0 for r in rows_trim]
+
+        try:
+            grf_leg0_x = get_list('grf_leg0_x')
+            grf_leg1_x = get_list('grf_leg1_x')
+            grf_leg2_x = get_list('grf_leg2_x')
+            grf_leg3_x = get_list('grf_leg3_x')
+
+            grf_leg0_y = get_list('grf_leg0_y')
+            grf_leg1_y = get_list('grf_leg1_y')
+            grf_leg2_y = get_list('grf_leg2_y')
+            grf_leg3_y = get_list('grf_leg3_y')
+
+            grf_leg0_z = get_list('grf_leg0_z')
+            grf_leg1_z = get_list('grf_leg1_z')
+            grf_leg2_z = get_list('grf_leg2_z')
+            grf_leg3_z = get_list('grf_leg3_z')
+
+            f_net_x = [grf_leg0_x[i] + grf_leg1_x[i] + grf_leg2_x[i] + grf_leg3_x[i] for i in range(0, len(grf_leg1_x))]
+            f_net_y = [grf_leg0_y[i] + grf_leg1_y[i] + grf_leg2_y[i] + grf_leg3_y[i] for i in range(0, len(grf_leg1_y))]
+            f_net_z = [grf_leg0_z[i] + grf_leg1_z[i] + grf_leg2_z[i] + grf_leg3_z[i] for i in range(0, len(grf_leg1_z))]
+
+            body_position_x = get_list('body_pose_position_x')
+            body_position_y = get_list('body_pose_position_y')
+            body_position_z = get_list('body_pose_position_z')
+        except Exception:
+            return np.array([]), np.array([])
 
     contacts = np.where(grf_leg0_z > np.mean(grf_leg0_z), 1, 0)
 

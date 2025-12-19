@@ -54,6 +54,16 @@ int main(int argc, char** argv) {
 #endif
   absl::ParseCommandLine(argc, argv);
 
+  // Allow overriding internal GRF align weight via environment variable
+  if (const char* env = std::getenv("MJPC_INTERNAL_GRF_ALIGN_WEIGHT")) {
+    try {
+      double v = std::stod(std::string(env));
+      absl::SetFlag(&FLAGS_internal_grf_align_weight, v);
+    } catch (...) {
+      // ignore parse errors
+    }
+  }
+
   std::string task_name = absl::GetFlag(FLAGS_task);
 
   // If invoked as `mjpc_mod` and the user did not override --task (left as the
