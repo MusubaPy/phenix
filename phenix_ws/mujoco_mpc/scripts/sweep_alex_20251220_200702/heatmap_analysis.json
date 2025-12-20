@@ -1,0 +1,20 @@
+{
+  "1e-9": {
+    "best": {
+      "p": "0.1",
+      "a": "1e-10",
+      "mean_total_J": 205.61871158176032
+    },
+    "better_than_vanilla_count": 76,
+    "total_combos": 100
+  },
+  "1e-10": {
+    "best": {
+      "p": "0.1",
+      "a": "1e-07",
+      "mean_total_J": 163.85620577138863
+    },
+    "better_than_vanilla_count": 89,
+    "total_combos": 100
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "aggregate": {
+    "p=vanilla,a=vanilla,fx=vanilla": {
+      "params": {
+        "p": "vanilla",
+        "a": "vanilla",
+        "fx": "vanilla"
+      },
+      "n_runs": 3,
+      "mean_mechanical_J": 167.4312333802167,
+      "mean_heat_J": 189.1710441011846,
+      "mean_total_J": 356.60227748140125,
+      "mean_distance_m": 10.61665361109873
+    }
+  },
+  "top": [
+    {
+      "key": "p=vanilla,a=vanilla,fx=vanilla",
+      "params": {
+        "p": "vanilla",
+        "a": "vanilla",
+        "fx": "vanilla"
+      },
+      "metrics": {
+        "params": {
+          "p": "vanilla",
+          "a": "vanilla",
+          "fx": "vanilla"
+        },
+        "n_runs": 3,
+        "mean_mechanical_J": 167.4312333802167,
+        "mean_heat_J": 189.1710441011846,
+        "mean_total_J": 356.60227748140125,
+        "mean_distance_m": 10.61665361109873
+      }
+    }
+  ]
+}
