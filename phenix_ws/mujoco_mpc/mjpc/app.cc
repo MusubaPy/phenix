@@ -14,9 +14,14 @@
 
 #include "mjpc/app.h"
 #include <absl/flags/flag.h>
+#include <absl/flags/parse.h>
 #include <absl/flags/declare.h>
 
 ABSL_DECLARE_FLAG(double, max_sim_time);
+ABSL_DECLARE_FLAG(bool, alex_enabled);
+ABSL_DECLARE_FLAG(double, alex_power_weight);
+ABSL_DECLARE_FLAG(double, alex_align_weight);
+ABSL_DECLARE_FLAG(double, alex_fx_smooth_weight);
 
 #include <algorithm>
 #include <atomic>
@@ -101,8 +106,8 @@ bool TaskShouldHoldStartup(double time) {
   // controller will run normally. Separately, at ~5s we enable manual gait
   // (select_Gait switch -> Manual) and set gait to Trot (index 2) once.
   constexpr double kDefaultWarmupZeroTorqueTime = 1.0;
-  constexpr double kManualEnableTime = 5.0;
-  constexpr double kModeSwitchTime = 10.0;
+  constexpr double kManualEnableTime = 2.0;
+  constexpr double kModeSwitchTime = 4.0;
 
   // One-shot per-task guard for toggling manual trot
   static int last_task_id = -1;
@@ -181,6 +186,19 @@ void controller(const mjModel* m, mjData* data) {
       data->ctrl[j] += ctrlnoise[j];
     }
   }
+
+  // Debug: print active Alex parameter values for visibility on startup.
+  // if (sim->agent->ActiveTask()) {
+  //   auto* task = sim->agent->ActiveTask();
+  //   int id_en = mjpc::ParameterIndex(m, "Alex enabled");
+  //   int id_pw = mjpc::ParameterIndex(m, "Alex power weight");
+  //   int id_al = mjpc::ParameterIndex(m, "Alex align weight");
+  //   int id_fx = mjpc::ParameterIndex(m, "Alex fx smooth weight");
+  //   if (id_en >= 0) std::cout << "[MJPC] Alex enabled param = " << task->parameters[id_en] << "\n";
+  //   if (id_pw >= 0) std::cout << "[MJPC] Alex power weight param = " << task->parameters[id_pw] << "\n";
+  //   if (id_al >= 0) std::cout << "[MJPC] Alex align weight param = " << task->parameters[id_al] << "\n";
+  //   if (id_fx >= 0) std::cout << "[MJPC] Alex fx smooth weight param = " << task->parameters[id_fx] << "\n";
+  // }
 }
 
 // sensor
@@ -330,6 +348,38 @@ void PhysicsLoop(mj::Simulate& sim) {
           sim.agent->Reset(dnew->ctrl);
         } else {
           sim.agent->Reset();
+        }
+
+        // Override Alexander residual parameters from CLI flags if provided
+        // (flags added in main.cc and available in mjpc_mod).
+        {
+          auto* task = sim.agent->ActiveTask();
+          if (task) {
+            int idx_enabled = mjpc::ParameterIndex(mnew, "Alex enabled");
+            if (idx_enabled >= 0 && idx_enabled < static_cast<int>(task->parameters.size()) &&
+                absl::flags_internal::WasPresentOnCommandLine("alex_enabled")) {
+              task->parameters[idx_enabled] = absl::GetFlag(FLAGS_alex_enabled) ? 1.0 : 0.0;
+              std::cout << "[MJPC] Overriding 'Alex enabled' -> " << task->parameters[idx_enabled] << " (from --alex_enabled)\n";
+            }
+            int idx_power = mjpc::ParameterIndex(mnew, "Alex power weight");
+            if (idx_power >= 0 && idx_power < static_cast<int>(task->parameters.size()) &&
+                absl::flags_internal::WasPresentOnCommandLine("alex_power_weight")) {
+              task->parameters[idx_power] = absl::GetFlag(FLAGS_alex_power_weight);
+              std::cout << "[MJPC] Overriding 'Alex power weight' -> " << task->parameters[idx_power] << " (from --alex_power_weight)\n";
+            }
+            int idx_align = mjpc::ParameterIndex(mnew, "Alex align weight");
+            if (idx_align >= 0 && idx_align < static_cast<int>(task->parameters.size()) &&
+                absl::flags_internal::WasPresentOnCommandLine("alex_align_weight")) {
+              task->parameters[idx_align] = absl::GetFlag(FLAGS_alex_align_weight);
+              std::cout << "[MJPC] Overriding 'Alex align weight' -> " << task->parameters[idx_align] << " (from --alex_align_weight)\n";
+            }
+            int idx_fx = mjpc::ParameterIndex(mnew, "Alex fx smooth weight");
+            if (idx_fx >= 0 && idx_fx < static_cast<int>(task->parameters.size()) &&
+                absl::flags_internal::WasPresentOnCommandLine("alex_fx_smooth_weight")) {
+              task->parameters[idx_fx] = absl::GetFlag(FLAGS_alex_fx_smooth_weight);
+              std::cout << "[MJPC] Overriding 'Alex fx smooth weight' -> " << task->parameters[idx_fx] << " (from --alex_fx_smooth_weight)\n";
+            }
+          }
         }
         sim.agent->PlotInitialize();
 
@@ -498,6 +548,10 @@ namespace mjpc {
 MjpcApp::MjpcApp(std::vector<std::shared_ptr<mjpc::Task>> tasks, int task_id) {
   // MJPC
   printf("MuJoCo MPC (MJPC)\n");
+  // Print whether alex flags were present on the original command line.
+  std::cout << "[MJPC] alex_enabled present on command line: "
+            << (absl::flags_internal::WasPresentOnCommandLine("alex_enabled") ? "yes" : "no")
+            << "\n";
 
   // MuJoCo
   std::printf(" MuJoCo version %s\n", mj_versionString());
@@ -544,6 +598,41 @@ MjpcApp::MjpcApp(std::vector<std::shared_ptr<mjpc::Task>> tasks, int task_id) {
   sim->agent->Allocate();
   sim->agent->Reset();
   sim->agent->PlotInitialize();
+
+  // Apply Alexander CLI flag overrides on initial load as well.
+  {
+    auto* task = sim->agent->ActiveTask();
+    if (task) {
+      int idx_enabled = mjpc::ParameterIndex(m, "Alex enabled");
+      if (idx_enabled >= 0 && idx_enabled < static_cast<int>(task->parameters.size()) &&
+          absl::flags_internal::WasPresentOnCommandLine("alex_enabled")) {
+        task->parameters[idx_enabled] = absl::GetFlag(FLAGS_alex_enabled) ? 1.0 : 0.0;
+        std::cout << "[MJPC] Overriding 'Alex enabled' -> " << task->parameters[idx_enabled]
+                  << " (from --alex_enabled)\n";
+      }
+      int idx_power = mjpc::ParameterIndex(m, "Alex power weight");
+      if (idx_power >= 0 && idx_power < static_cast<int>(task->parameters.size()) &&
+          absl::flags_internal::WasPresentOnCommandLine("alex_power_weight")) {
+        task->parameters[idx_power] = absl::GetFlag(FLAGS_alex_power_weight);
+        std::cout << "[MJPC] Overriding 'Alex power weight' -> " << task->parameters[idx_power]
+                  << " (from --alex_power_weight)\n";
+      }
+      int idx_align = mjpc::ParameterIndex(m, "Alex align weight");
+      if (idx_align >= 0 && idx_align < static_cast<int>(task->parameters.size()) &&
+          absl::flags_internal::WasPresentOnCommandLine("alex_align_weight")) {
+        task->parameters[idx_align] = absl::GetFlag(FLAGS_alex_align_weight);
+        std::cout << "[MJPC] Overriding 'Alex align weight' -> " << task->parameters[idx_align]
+                  << " (from --alex_align_weight)\n";
+      }
+      int idx_fx = mjpc::ParameterIndex(m, "Alex fx smooth weight");
+      if (idx_fx >= 0 && idx_fx < static_cast<int>(task->parameters.size()) &&
+          absl::flags_internal::WasPresentOnCommandLine("alex_fx_smooth_weight")) {
+        task->parameters[idx_fx] = absl::GetFlag(FLAGS_alex_fx_smooth_weight);
+        std::cout << "[MJPC] Overriding 'Alex fx smooth weight' -> " << task->parameters[idx_fx]
+                  << " (from --alex_fx_smooth_weight)\n";
+      }
+    }
+  }
 
   sim->agent->plan_enabled = absl::GetFlag(FLAGS_planner_enabled);
 

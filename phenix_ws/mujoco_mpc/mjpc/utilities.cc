@@ -214,9 +214,9 @@ double DefaultParameterValue(const mjModel* model, std::string_view name) {
 int ParameterIndex(const mjModel* model, std::string_view name) {
   int id =
       mj_name2id(model, mjOBJ_NUMERIC, absl::StrCat("residual_", name).c_str());
-
   if (id == -1) {
-    mju_error_s("Parameter '%s' not found", std::string(name).c_str());
+    // Do not abort here; return -1 so callers can check presence safely.
+    return -1;
   }
 
   int i;

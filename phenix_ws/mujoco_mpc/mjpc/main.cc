@@ -34,6 +34,16 @@ ABSL_FLAG(double, max_sim_time, 60.0,
 ABSL_FLAG(double, internal_grf_align_weight, 1e-3,
           "Internal Kuznetsov GRF alignment residual weight (per-foot scale). Set to 0 to disable.");
 
+// Alexander cost runtime flags (available to mjpc and mjpc_mod binaries).
+ABSL_FLAG(bool, alex_enabled, false,
+          "Enable Alexander residual (overrides model parameter 'Alex enabled')");
+ABSL_FLAG(double, alex_power_weight, 1.0,
+          "Weight for Alexander power term (overrides 'Alex power weight')");
+ABSL_FLAG(double, alex_align_weight, 1.0,
+          "Weight for Alexander alignment term (overrides 'Alex align weight')");
+ABSL_FLAG(double, alex_fx_smooth_weight, 1.0,
+          "Weight for Alexander Fx smoothness term (overrides 'Alex fx smooth weight')");
+
 // machinery for replacing command line error by a macOS dialog box
 // when running under Rosetta
 #if defined(__APPLE__) && defined(__AVX__)

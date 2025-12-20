@@ -17,7 +17,7 @@
     <!-- residual -->
     <numeric name="residual_select_Gait" data="0"/>
     <text name="residual_list_Gait" data="Stand|Walk|Trot|Canter|Gallop"/>
-  <numeric name="residual_select_Gait switch" data="1"/>
+    <numeric name="residual_select_Gait switch" data="1"/>
     <text name="residual_list_Gait switch" data="Manual|Automatic"/>
     <numeric name="residual_Cadence" data="2 0 4" />
     <numeric name="residual_Amplitude" data=".06 0 0.2" />
@@ -25,11 +25,12 @@
     <numeric name="residual_Walk speed" data="0.45 0 4"/>
     <numeric name="residual_Walk turn" data="0 -2 2"/>
     <numeric name="residual_Debug GRF log" data="1 0 1"/>
-    <!-- default GRF cost weight (tuned via sweep). Set to 1.0 for balanced stability+energy -->
-    <!-- <numeric name="residual_GRF_weight" data="1.0 0 10" /> -->
-    <!-- expose GRF and alignment parameters in the UI -->
-    <!-- <numeric name="residual_GRF" data="1.0 0 10" /> -->
-    <!-- <numeric name="residual_Internal GRF Align" data="1.0 0 10" /> -->
+    <!-- Alexander residual controls: enable + per-term weights -->
+    <numeric name="residual_Alex enabled" data="0 0 1" />
+    <numeric name="residual_Alex power weight" data="1.0 0 10" />
+    <numeric name="residual_Alex align weight" data="1.0 0 10" />
+    <numeric name="residual_Alex fx smooth weight" data="1.0 0 10" />
+
     <numeric name="residual_select_Flip dir" data="0"/>
     <text name="residual_list_Flip dir" data="Back Flip|Front Flip"/>
     <numeric name="residual_select_Biped type" data="0"/>
@@ -116,9 +117,8 @@
     <user name="Posture" dim="12" user="0 0.02 0.0 0.1" />
     <user name="Orientation" dim="2" user="0 0 0 .03" />
     <user name="Angmom" dim="3" user="0 0 0 .03" />
-    <user name="GRF" dim="3" user="6 0.000025 0 0.0001 0.00001" />
-    <!-- Internal Kuznetsov alignment residuals: per-foot 3 components (4 feet -> dim 12) -->
-    <user name="Internal GRF Align" dim="12" user="0 0.001 0 0.001 0.0001" />
+    <!-- Alexander: [E_power_abs, E_align (rad), E_fx_smooth] -->
+    <user name="Alexander" dim="3" user="0 0.001 0 0.001 0.0001" />
 
     <!-- estimator measurements -->
     <framepos name="torso_pos" objtype="site" objname="torso" />

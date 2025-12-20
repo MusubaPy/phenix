@@ -611,6 +611,14 @@ void QuadrupedFlat::ModifyScene(const mjModel* model, const mjData* data,
 // save task-related ids
 void QuadrupedFlat::ResetLocked(const mjModel* model) {
   (void)model;
+  // Ensure a reproducible seed is available for quick checks. Do not overwrite
+  // an explicitly provided MJPC_SEED in the environment.
+  auto set_default = [](const char* name, const char* val) {
+    if (!std::getenv(name)) {
+      setenv(name, val, 0);
+    }
+  };
+  set_default("MJPC_SEED", "1");
   // ----------  task identifiers  ----------
   residual_.gait_param_id_ = ParameterIndex(model, "select_Gait");
   (void)residual_.gait_param_id_;
